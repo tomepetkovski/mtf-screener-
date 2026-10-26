@@ -408,7 +408,7 @@ with t4:
         n_paths = k8.select_slider("MC paths", [1000, 2000, 5000, 10000], 5000)
         k9, k10, k11 = st.columns(3)
         drift = k9.toggle("Include historical drift", True)
-        equity = k10.number_input("Account size (USDT)", 10.0, 10**9, 1000.0, 100.0)
+        equity = k10.number_input("Account size (USDT)", 10.0, 1e9, 1000.0, 100.0)
         risk_pct = k11.number_input("Risk per trade (%)", 0.1, 10.0, 1.0, 0.1)
 
         try:

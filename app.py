@@ -40,6 +40,40 @@ DEFAULT_RULES = {
     "1d":  ("Above", "Any", "Any"),
     "1w":  ("Above", "Any", "Any"),
 }
+
+# Presets use the same per-timeframe rule structure:
+# (Price vs EMA50, Price vs EMA200, EMA50 vs EMA200).
+PRESETS = {
+    "Custom": None,
+    "Full stack (4H–1W)": {
+        "15m": ("Any", "Any", "Any"),
+        "1h":  ("Any", "Any", "Any"),
+        "4h":  ("Above", "Above", "50>200"),
+        "1d":  ("Above", "Above", "50>200"),
+        "1w":  ("Above", "Above", "50>200"),
+    },
+    "Pullback in uptrend": {
+        "15m": ("Any", "Any", "Any"),
+        "1h":  ("Below", "Above", "50>200"),
+        "4h":  ("Below", "Above", "50>200"),
+        "1d":  ("Above", "Above", "50>200"),
+        "1w":  ("Above", "Above", "50>200"),
+    },
+    "4H reclaim, 1D still below": {
+        "15m": ("Any", "Any", "Any"),
+        "1h":  ("Any", "Any", "Any"),
+        "4h":  ("Above", "Above", "50>200"),
+        "1d":  ("Any", "Below", "Any"),
+        "1w":  ("Any", "Any", "Any"),
+    },
+    "Full bear stack": {
+        "15m": ("Any", "Any", "Any"),
+        "1h":  ("Any", "Any", "Any"),
+        "4h":  ("Below", "Below", "50<200"),
+        "1d":  ("Below", "Below", "50<200"),
+        "1w":  ("Below", "Below", "50<200"),
+    },
+}
 TF_MINUTES = {"15m": 15, "1h": 60, "4h": 240, "1d": 1440, "1w": 10080}
 
 # ── HTTP ────────────────────────────────────────────────────────
@@ -326,16 +360,31 @@ order = st.sidebar.multiselect("Data sources (priority order)", ["okx", "bybit",
 refresh = st.sidebar.slider("Auto-refresh (minutes, 0 = off)", 0, 30, 0)
 alerts = st.sidebar.toggle("Telegram alerts (needs secrets)", False)
 
+st.sidebar.subheader("EMA criteria presets")
+preset_name = st.sidebar.selectbox(
+    "Preset",
+    list(PRESETS.keys()),
+    index=0,
+    help="Choose a preset from the reference image, or Custom to set each timeframe manually."
+)
+
 st.sidebar.subheader("Rules per timeframe")
-rules = []
+manual_rules = []
 for tf in TFS:
     d = DEFAULT_RULES[tf]
     st.sidebar.markdown(f"**{tf}**")
     c1, c2, c3 = st.sidebar.columns(3)
-    a = c1.selectbox("P/50", PRICE_OPTS, PRICE_OPTS.index(d[0]), key=f"a{tf}")
-    b = c2.selectbox("P/200", PRICE_OPTS, PRICE_OPTS.index(d[1]), key=f"b{tf}")
-    c = c3.selectbox("50/200", CROSS_OPTS, CROSS_OPTS.index(d[2]), key=f"c{tf}")
-    rules.append((tf, (a, b, c)))
+    a = c1.selectbox("Price / EMA50", PRICE_OPTS, PRICE_OPTS.index(d[0]), key=f"a{tf}")
+    b = c2.selectbox("Price / EMA200", PRICE_OPTS, PRICE_OPTS.index(d[1]), key=f"b{tf}")
+    c = c3.selectbox("EMA50 / EMA200", CROSS_OPTS, CROSS_OPTS.index(d[2]), key=f"c{tf}")
+    manual_rules.append((tf, (a, b, c)))
+
+# A selected preset takes precedence; Custom uses the manual controls above.
+if PRESETS[preset_name] is None:
+    rules = manual_rules
+else:
+    rules = [(tf, PRESETS[preset_name][tf]) for tf in TFS]
+    st.sidebar.caption(f"Active preset: {preset_name}")
 
 if refresh:
     st_autorefresh(interval=refresh * 60_000, key="auto")

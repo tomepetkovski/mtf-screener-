@@ -657,8 +657,23 @@ def _analyst_label(r):
            else "Sell" if sc > -1.2 else "Strong Sell")
     return f"{lab} ({n})", sc
 
+def _analyst_trend(d):
+    """Latest Finnhub recommendation vs the previous month: label gets ▲ / ▼ when
+    the consensus score moved by >= 0.15 (on the -2..+2 scale)."""
+    rows = sorted(d, key=lambda r: r.get("period", ""), reverse=True)
+    label, sc = _analyst_label(rows[0])
+    if sc is None or len(rows) < 2:
+        return label, sc
+    _, prev = _analyst_label(rows[1])
+    if prev is not None:
+        if sc - prev >= 0.15:
+            label += " ▲"
+        elif sc - prev <= -0.15:
+            label += " ▼"
+    return label, sc
+
 def analyst_rating(sym, key):
-    """(label, score) from Finnhub recommendation trends; cached 24h, ~1 call/second."""
+    """(label, score) from Finnhub recommendation trends (with ▲/▼ trend); cached 24h, ~1 call/second."""
     store = _store()
     k = ("__fh__", sym)
     with _CACHE_LOCK:
@@ -675,56 +690,7 @@ def analyst_rating(sym, key):
         store[k] = (time.time(), res)
     return res
 
-@st.cache_data(ttl=300, show_spinner=False)
-def enrich_rows(market, src, syms, tf, n_break, vol_mult, live, oi_lb, fh_key):
-    stocks = market == "stocks"
-
-    def one(s):
-        out = {"Breakout": "n/a", "Crash": None}
-        try:
-            cdf = get_candles(src, s, tf)
-            if cdf is None or len(cdf) < 30:
-                return s, out
-            out["Breakout"] = breakout_signal(cdf, n_break, vol_mult, live) or "n/a"
-            cs = crash_score(cdf, live)
-            out["Crash"] = cs[0] if cs else None
-            if not stocks:
-                out["OI"] = oi_signal(s, tf, cdf, oi_lb, live)
-        except Exception:
-            pass
-        return s, out
-
-    with ThreadPoolExecutor(max_workers=8 if stocks else 16) as ex:
-        res = dict(ex.map(one, syms))
-    if stocks and fh_key:
-        for i, s in enumerate(syms):
-            if i >= ANALYST_MAX:
-                res[s]["Analyst"] = "limit"
-                continue
-            label, score = analyst_rating(s, fh_key)
-            res[s]["Analyst"], res[s]["_as"] = label, score
-    return res
-
-@st.cache_data(ttl=300, show_spinner=False)
-def market_regime(market, src):
-    """Benchmark trend: BTC (crypto) or SPY (stocks) on 1D."""
-    sym = "SPY" if market == "stocks" else "BTCUSDT"
-    df = get_candles(src, sym, "1d")
-    if df is None or len(df) < 210:
-        return None
-    c = df["close"].tolist()
-    p, e50, e200 = c[-1], ema_series(c, 50)[-1], ema_series(c, 200)[-1]
-    cs = crash_score(df, True)
-    state = "RISK-OFF" if p < e200 else ("CAUTION" if p < e50 else "RISK-ON")
-    return {"sym": sym, "state": state, "d200": (p / e200 - 1) * 100, "crash": cs[0] if cs else None}
-# ════════════════════════════════════════════════════════════════
-# ADD-ONS for MTF EMA Screener Pro
-# Paste this block right AFTER the "Extra signals" section (after market_regime)
-# and BEFORE the "Sidebar" section. It reuses: fetch, BN, BY, OK, atr, np, pd, go,
-# _store, _CACHE_LOCK, _analyst_label.
-# ════════════════════════════════════════════════════════════════
-
-# ── 1. Volume flow: how unusual is volume, and which side is it on? ──────────
+# ── Volume flow: how unusual is volume, and which side is it on? ─────────────
 def _robust_z(x, window=50):
     """z-score of the last value vs the previous `window` values using median/MAD.
     Volume is heavy-tailed, so mean/std z-scores are dominated by one spike."""
@@ -770,7 +736,7 @@ def volume_flow(df, live=True, window=50, k=3):
 def flow_text(f):
     return "n/a" if not f else f"{f[0]} (vz {f[1]:+.1f} · dz {f[2]:+.1f})"
 
-# ── 2. Order-book walls (crypto only: stocks have no free L2 feed) ───────────
+# ── Order-book walls (crypto only: stocks have no free L2 feed) ──────────────
 def _lv(rows):
     return [(float(x[0]), float(x[1])) for x in rows]
 
@@ -795,8 +761,8 @@ def _usd(x):
 
 def orderbook_levels(src, sym, price, atr_abs=0.0, band=0.03, bins=40, z=3.0):
     """Bucket resting orders (USD notional) around price and flag buckets that are
-    statistical outliers (robust z >= z) as walls. Also returns book imbalance within +-1%
-    and a wall-based limit-entry suggestion."""
+    statistical outliers (robust z >= z) as walls. Also returns book imbalance (over the range
+    both sides of the snapshot cover, max +-1%) and a wall-based limit-entry suggestion."""
     ob = get_orderbook(src, sym)
     if not ob or not ob[0] or not ob[1]:
         return None
@@ -838,7 +804,9 @@ def orderbook_levels(src, sym, price, atr_abs=0.0, band=0.03, bins=40, z=3.0):
         return out
 
     bw, aw = walls(b), walls(a)
-    near = lambda lv, side: sum(p * q for p, q in lv if abs(p / price - 1) <= 0.01)
+    # imbalance over the range BOTH sides actually cover (max 1%), so the sides are comparable
+    cov = min(0.01, (price - min(p for p, _ in bids)) / price, (max(p for p, _ in asks) - price) / price)
+    near = lambda lv, side: sum(p * q for p, q in lv if abs(p / price - 1) <= cov)
     B, A = near(bids, "b"), near(asks, "a")
     imb = (B - A) / (B + A) if (B + A) > 0 else 0.0
     buf = 0.1 * atr_abs
@@ -879,15 +847,18 @@ def add_walls(fig, lv):
                       annotation_position="top left", annotation_font_color="#ef4444")
     return fig
 
-# ── 3. Footprint-style volume at price from recent trades (crypto) ───────────
+# ── Footprint-style volume at price from recent trades (crypto) ──────────────
 def get_trades(src, sym):
-    """[(price, qty, taker_is_buy)] for the most recent ~500-1000 trades, or None."""
+    """[(price, qty, taker_is_buy)] for the most recent trades, or None.
+    Bybit spot recent-trade is capped at ~60 rows, so the linear perp (up to 1000) is tried first."""
     try:
         if src == "binance":
             d = fetch(BN, "/api/v3/aggTrades", {"symbol": sym, "limit": 1000})
             return [(float(t["p"]), float(t["q"]), not t["m"]) for t in d]   # m=True -> seller was taker
         if src == "bybit":
-            d = fetch(BY, "/v5/market/recent-trade", {"category": "spot", "symbol": sym, "limit": 1000})
+            d = fetch(BY, "/v5/market/recent-trade", {"category": "linear", "symbol": sym, "limit": 1000})
+            if not (isinstance(d, dict) and (d.get("result") or {}).get("list")):
+                d = fetch(BY, "/v5/market/recent-trade", {"category": "spot", "symbol": sym, "limit": 60})
             return [(float(t["price"]), float(t["size"]), t["side"] == "Buy") for t in d["result"]["list"]]
         if src == "okx":
             d = fetch(OK, "/api/v5/market/trades", {"instId": sym[:-4] + "-USDT", "limit": 500})
@@ -903,7 +874,7 @@ def footprint(src, sym, bins=40, imb_ratio=3.0):
     if not tr or len(tr) < 50:
         return None
     p = np.array([t[0] for t in tr]); q = np.array([t[1] for t in tr])
-    isb = np.array([t[2] for t in tr])
+    isb = np.array([t[2] for t in tr], dtype=bool)
     lo, hi = p.min(), p.max()
     if hi <= lo:
         return None
@@ -931,7 +902,7 @@ def footprint_chart(fp, poc, entry=None):
                       margin=dict(l=10, r=10, t=30, b=10), title="Volume at price (buy right / sell left)")
     return fig
 
-# ── 4. Stocks: no free order book -> high-volume nodes as proxy walls ────────
+# ── Stocks: no free order book -> high-volume nodes as proxy support/resistance ──
 def volume_nodes(df, bins=40, top=3):
     """Volume-at-price from candles (typical price). POC + top high-volume nodes act as
     support/resistance. A proxy only: it is traded volume, not resting orders."""
@@ -950,23 +921,55 @@ def volume_nodes(df, bins=40, top=3):
             break
     return nodes          # first = POC
 
-# ── 5. Analyst rating WITH direction (upgrade / downgrade trend) ─────────────
-def _analyst_trend(d):
-    """Latest Finnhub recommendation vs the previous month: label gets ▲ / ▼ when
-    the consensus score moved by >= 0.15 (on the -2..+2 scale)."""
-    rows = sorted(d, key=lambda r: r.get("period", ""), reverse=True)
-    label, sc = _analyst_label(rows[0])
-    if sc is None or len(rows) < 2:
-        return label, sc
-    _, prev = _analyst_label(rows[1])
-    if prev is not None:
-        if sc - prev >= 0.15:
-            label += " ▲"
-        elif sc - prev <= -0.15:
-            label += " ▼"
-    return label, sc
+# ── Enrichment for MATCH/WATCH rows ─────────────────────────────
+@st.cache_data(ttl=300, show_spinner=False)
+def enrich_rows(market, src, syms, tf, n_break, vol_mult, live, oi_lb, fh_key):
+    stocks = market == "stocks"
 
+    def one(s):
+        out = {"Breakout": "n/a", "Crash": None}
+        try:
+            cdf = get_candles(src, s, tf)
+            if cdf is None or len(cdf) < 30:
+                return s, out
+            out["Breakout"] = breakout_signal(cdf, n_break, vol_mult, live) or "n/a"
+            cs = crash_score(cdf, live)
+            out["Crash"] = cs[0] if cs else None
+            out["Flow"] = flow_text(volume_flow(cdf, live))
+            if not stocks:
+                out["OI"] = oi_signal(s, tf, cdf, oi_lb, live)
+                try:
+                    px = float(cdf["close"].iloc[-1])
+                    out["Book"] = book_label(orderbook_levels(src, s, px, float(atr(cdf).iloc[-1])), px)
+                except Exception:
+                    out["Book"] = "n/a"
+        except Exception:
+            pass
+        return s, out
 
+    with ThreadPoolExecutor(max_workers=8 if stocks else 16) as ex:
+        res = dict(ex.map(one, syms))
+    if stocks and fh_key:
+        for i, s in enumerate(syms):
+            if i >= ANALYST_MAX:
+                res[s]["Analyst"] = "limit"
+                continue
+            label, score = analyst_rating(s, fh_key)
+            res[s]["Analyst"], res[s]["_as"] = label, score
+    return res
+
+@st.cache_data(ttl=300, show_spinner=False)
+def market_regime(market, src):
+    """Benchmark trend: BTC (crypto) or SPY (stocks) on 1D."""
+    sym = "SPY" if market == "stocks" else "BTCUSDT"
+    df = get_candles(src, sym, "1d")
+    if df is None or len(df) < 210:
+        return None
+    c = df["close"].tolist()
+    p, e50, e200 = c[-1], ema_series(c, 50)[-1], ema_series(c, 200)[-1]
+    cs = crash_score(df, True)
+    state = "RISK-OFF" if p < e200 else ("CAUTION" if p < e50 else "RISK-ON")
+    return {"sym": sym, "state": state, "d200": (p / e200 - 1) * 100, "crash": cs[0] if cs else None}
 
 # ── Sidebar ─────────────────────────────────────────────────────
 st.sidebar.header("⚙️ Settings")
@@ -996,7 +999,7 @@ refresh = st.sidebar.slider("Auto-refresh (minutes, 0 = off)", 0, 30, 0)
 alerts = st.sidebar.toggle("Telegram alerts (needs secrets)", False)
 
 st.sidebar.subheader("Extra signals")
-extras_on = st.sidebar.toggle("Breakout · crash risk · OI · analyst (MATCH/WATCH rows)", True,
+extras_on = st.sidebar.toggle("Breakout · crash risk · flow · OI · book · analyst (MATCH/WATCH rows)", True,
                               help="Computed only for MATCH/WATCH rows, so the extra API cost is small.")
 sig_tf = st.sidebar.selectbox("Signal timeframe", TFS, index=3)
 n_break = st.sidebar.slider("Breakout lookback (bars)", 10, 100, 20)
@@ -1103,7 +1106,7 @@ if extras_on:
         regime = market_regime(market, data_src)
     except Exception:
         regime = None
-    for col in ("Breakout", "Crash", "OI", "Analyst"):
+    for col in ("Breakout", "Crash", "Flow", "OI", "Book", "Analyst"):
         if any(col in v for v in extra.values()):
             df[col] = df["Symbol"].map(lambda s, c=col: extra.get(s, {}).get(c))
     if "Crash" in df.columns:
@@ -1219,8 +1222,16 @@ with t4:
                 pos_txt = f"{qty:,.0f} shares" if is_stocks else f"{qty:,.4f} {sym[:-4]}"
 
                 left, right = st.columns([3, 1.1])
-                left.plotly_chart(build_chart(cdf, lf, ls, entry, sl, tps, mc, ctf, long),
-                                  width="stretch")
+                fig = build_chart(cdf, lf, ls, entry, sl, tps, mc, ctf, long)
+                lv = None
+                if not is_stocks:
+                    try:
+                        lv = orderbook_levels(data_src, sym, float(entry), float(atr(cdf).iloc[-1]))
+                    except Exception:
+                        lv = None
+                if lv:
+                    add_walls(fig, lv)
+                left.plotly_chart(fig, width="stretch")
                 with right:
                     st.markdown(f"### {sym} · {'🟢 LONG' if long else '🔴 SHORT'}")
                     st.markdown(f'<div class="lvl entry">ENTRY<span>{fmt(entry)}</span></div>'
@@ -1239,6 +1250,21 @@ with t4:
                               f"{fmt(mc['median'])}", f"{fmt(mc['p5'])} – {fmt(mc['p95'])}", delta_color="off")
                     st.metric("Position size", pos_txt,
                               f"≈ {qty * entry:,.0f} {ccy} · risk {equity * risk_pct / 100:,.2f}", delta_color="off")
+                    if lv:
+                        st.metric("Book imbalance (near price)", f"{lv['imbalance']:+.0%}")
+                        sug = lv["long_entry"] if long else lv["short_entry"]
+                        if sug:
+                            inv = sug.get("invalid_below") or sug.get("invalid_above")
+                            st.metric("Wall-based limit entry", fmt(sug["entry"]),
+                                      f"{_usd(sug['wall']['usd'])} wall · invalid beyond {fmt(inv)}",
+                                      delta_color="off")
+                    elif is_stocks:
+                        nodes = volume_nodes(cdf)
+                        st.metric("Volume POC (support/resist.)", fmt(nodes[0][0]))
+                    fl = volume_flow(cdf, live)
+                    if fl:
+                        st.metric(f"Volume flow ({ctf})", fl[0], f"vz {fl[1]:+.1f} · dz {fl[2]:+.1f}",
+                                  delta_color="off")
                     bo = breakout_signal(cdf, n_break, vol_mult, live)
                     cs = crash_score(cdf, live)
                     st.metric(f"Breakout ({ctf})", bo or "n/a")
@@ -1255,5 +1281,15 @@ with t4:
                     st.caption("Stocks: regular-session bars only; 4H bars are built from 1H "
                                "(09:30–13:30 and 13:30–16:00 ET); times shown in UTC. "
                                "Stops/gaps overnight are not modelled.")
+                if not is_stocks:
+                    with st.expander("🦶 Footprint: volume at price (latest trades)"):
+                        res_fp = footprint(data_src, sym)
+                        if res_fp:
+                            fp, poc, cvd = res_fp
+                            st.plotly_chart(footprint_chart(fp, poc, entry), width="stretch")
+                            st.caption(f"Net aggressive delta: {cvd:+,.2f} · POC {fmt(poc)} · "
+                                       "short sample (latest trades only)")
+                        else:
+                            st.info("No recent trade data available for this symbol.")
             except Exception as e:
                 st.error(f"Trade planner error: {e}")

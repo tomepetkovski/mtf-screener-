@@ -1795,6 +1795,12 @@ if refresh:
 st.markdown('<div class="hero"><h2>📈 MTF EMA Screener Pro</h2>'
             '<span>Multi-timeframe EMA scan · crypto + US stocks · positioning · events · journal · trade planner</span></div>',
             unsafe_allow_html=True)
+try:
+    import upatstvo
+    upatstvo.show(st)
+except Exception:
+    pass
+
 if st.button("🔄 Scan now"):
     run_scan.clear()
 

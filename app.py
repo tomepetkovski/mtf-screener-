@@ -282,6 +282,8 @@ PROVIDERS = {
 def _store():
     return {}
 
+_SHARED = _store()
+
 # Shared cache is written by many worker threads -> guard with a lock and prune it.
 _CACHE_LOCK = threading.Lock()
 _FH_LOCK = threading.Lock()          # serialises Finnhub calls (rate limit)
@@ -452,8 +454,8 @@ def atr(df, n=14):
     tr = pd.concat([df["high"] - df["low"], (df["high"] - pc).abs(), (df["low"] - pc).abs()], axis=1).max(axis=1)
     return tr.ewm(alpha=1 / n, adjust=False).mean()
 
-def trade_plan(df, direction, sl_mode, atr_mult, rr):
-    entry = df["close"].iloc[-1]
+def trade_plan(df, direction, sl_mode, atr_mult, rr, entry=None):
+    entry = df["close"].iloc[-1] if entry is None else entry
     a = atr(df).iloc[-1]
     long = direction == "Long"
     if sl_mode == "Swing (10 bars)":
@@ -735,12 +737,105 @@ def volume_flow(df, live=True, window=50, k=3):
 
 def flow_text(f):
     return "n/a" if not f else f"{f[0]} (vz {f[1]:+.1f} · dz {f[2]:+.1f})"
+def rules_direction(rules):
+    """True = the rule set is long-biased (Above / 50>200), False = short-biased."""
+    up = dn = 0
+    for _, (a, b, c) in rules:
+        up += (a == "Above") + (b == "Above") + (c == "50>200")
+        dn += (a == "Below") + (b == "Below") + (c == "50<200")
+    return up >= dn
 
+def conviction(ex, long, status, regime):
+    """0-100 setup score + breakdown. Direction-aware: the same signal helps a long and hurts a short.
+    ex keys (all optional): Breakout, Crash, OI, _dz (flow z), _imb (weighted book imbalance), _as (analyst)."""
+    sg = 1 if long else -1
+    clip = lambda x: max(-1.0, min(1.0, float(x)))
+    ok = lambda v: v is not None and np.isfinite(v)
+    p = {"MTF": 20 if status == "MATCH" else 8 if status == "WATCH" else 0}
+    if ok(ex.get("_dz")):
+        p["Flow"] = 12 * clip(sg * ex["_dz"] / 3)
+    if ok(ex.get("_imb")):
+        p["Book"] = 8 * clip(sg * ex["_imb"] / 0.4)
+    v = {"🟢": 8, "🟡": 3, "🟠": -5, "🔴": -8}.get(str(ex.get("OI") or "")[:1])
+    if v is not None:
+        p["OI"] = sg * v
+    bo = str(ex.get("Breakout") or "")
+    if bo.startswith("🚀"):
+        p["Break"] = sg * (10 + 3 * ("+VOL" in bo) + 2 * ("+SQZ" in bo))
+    elif bo.startswith("🔻"):
+        p["Break"] = -sg * (10 + 3 * ("+VOL" in bo))
+    if ok(ex.get("Crash")):
+        p["Crash"] = sg * (5 - 15 * ex["Crash"] / 100)
+    if regime:
+        p["Regime"] = sg * {"RISK-ON": 10, "CAUTION": 0, "RISK-OFF": -15}[regime["state"]]
+    if ok(ex.get("_as")):
+        p["Analyst"] = 6 * clip(sg * ex["_as"] / 1.2)
+    score = int(round(max(0, min(100, 50 + sum(p.values())))))
+    return score, p
+
+def grade(s):
+    return "A" if s >= 80 else "B" if s >= 65 else "C" if s >= 50 else "D"
+
+def blocked_tps(lv, entry, tps, long):
+    """Targets that sit behind an opposing wall: [(tp_number, wall)]."""
+    if not lv:
+        return []
+    out = []
+    for i, tp in enumerate(tps):
+        lo, hi = (entry, tp) if long else (tp, entry)
+        for w in (lv["ask_walls"] if long else lv["bid_walls"]):
+            if lo <= w["price"] <= hi:
+                out.append((i + 1, w))
+                break
+    return out
+
+def fill_prob(close, price, limit, long, horizon, n_paths=3000, seed=7):
+    """Chance that a limit order is touched within the horizon (bootstrap, drift removed, close-based)."""
+    rng = np.random.default_rng(seed)
+    r = np.diff(np.log(close))[-500:]
+    r = r - r.mean()
+    paths = price * np.exp(np.cumsum(r[rng.integers(0, len(r), (n_paths, horizon))], axis=1))
+    return float((paths.min(axis=1) <= limit).mean() if long else (paths.max(axis=1) >= limit).mean())
+    
 # ── Order-book walls (crypto only: stocks have no free L2 feed) ──────────────
 def _lv(rows):
     return [(float(x[0]), float(x[1])) for x in rows]
+def _ttl(key, ttl, fn):
+    store, now = _SHARED, time.time()
+    with _CACHE_LOCK:
+        hit = store.get(key)
+    if hit and now - hit[0] < ttl:
+        return hit[1]
+    val = fn()
+    if val is not None:
+        with _CACHE_LOCK:
+            store[key] = (now, val)
+    return val
 
 def get_orderbook(src, sym):
+    return _ttl(("__ob__", src, sym), 15, lambda: _get_orderbook_raw(src, sym))
+
+def _tag_persistence(bw, aw, src, sym, keep=6, min_gap=20, max_age=900):
+    """Adds w['persist'] = share of recent snapshots that had a wall at the same place
+    (None = no history yet). Spoofed walls tend to vanish, real ones stay."""
+    store, now = _SHARED, time.time()
+    key = ("__obh__", src, sym)
+    with _CACHE_LOCK:
+        hit = store.get(key)
+    hist = [h for h in (hit[1] if hit else []) if now - h[0] <= max_age]
+    for side, ws in (("b", bw), ("a", aw)):
+        for w in ws:
+            w["persist"] = (sum(any(s == side and not (w["hi"] < lo or w["lo"] > hi) for s, lo, hi in h[1])
+                                for h in hist) / len(hist)) if hist else None
+    if not hist or now - hist[-1][0] >= min_gap:
+        hist.append((now, [("b", w["lo"], w["hi"]) for w in bw] + [("a", w["lo"], w["hi"]) for w in aw]))
+    with _CACHE_LOCK:
+        store[key] = (now, hist[-keep:])
+
+def _pers(w):
+    return "" if w.get("persist") is None else f" · seen {w['persist']:.0%}"
+    
+def _get_orderbook_raw(src, sym):
     """(bids, asks) as [(price, qty)], or None."""
     try:
         if src == "binance":
@@ -758,6 +853,7 @@ def get_orderbook(src, sym):
 
 def _usd(x):
     return f"${x / 1e6:.1f}M" if x >= 1e6 else f"${x / 1e3:.0f}k"
+    
 def orderbook_levels(src, sym, price, atr_abs=0.0, band=0.03, bins=40, z=3.0):
     """Bucket resting orders (USD notional) around price and flag buckets that are
     statistical outliers (robust z >= z) as walls. Also returns book imbalance (over the range
@@ -813,6 +909,7 @@ def orderbook_levels(src, sym, price, atr_abs=0.0, band=0.03, bins=40, z=3.0):
         return out
 
     bw, aw = walls(b), walls(a)
+    _tag_persistence(bw, aw, src, sym)
     # imbalance over the range BOTH sides actually cover (max 1%), so the sides are comparable
     cov = min(0.01, (price - min_bid) / price, (max_ask - price) / price)
     if cov <= 0:
@@ -836,7 +933,8 @@ def orderbook_levels(src, sym, price, atr_abs=0.0, band=0.03, bins=40, z=3.0):
     below = [w for w in bw if w["hi"] <= price * 1.001]
     above = [w for w in aw if w["lo"] >= price * 0.999]
     # prefer big walls, but penalise walls that are far away (less likely to be reached / fill)
-    score = lambda w: w["usd"] / (1 + 100 * abs(w["price"] / price - 1))
+    pw = lambda w: 1.0 if w.get("persist") is None else 0.5 + 0.5 * w["persist"]
+    score = lambda w: w["usd"] * pw(w) / (1 + 100 * abs(w["price"] / price - 1))   # <- replaces old score
     if below:
         w = max(below, key=score)
         long_entry = {"entry": min(w["hi"] + buf, price), "invalid_below": w["lo"] - buf, "wall": w}
@@ -866,16 +964,16 @@ def add_walls(fig, lv):
         return fig
     for w in lv["bid_walls"]:
         fig.add_hrect(y0=w["lo"], y1=w["hi"], fillcolor="rgba(34,197,94,.22)", line_width=0,
-                      annotation_text=f"BID wall {_usd(w['usd'])} (z {w['z']:.1f})",
+                      annotation_text=f"BID wall {_usd(w['usd'])} (z {w['z']:.1f}){_pers(w)}",
                       annotation_position="bottom left", annotation_font_color="#22c55e")
     for w in lv["ask_walls"]:
         fig.add_hrect(y0=w["lo"], y1=w["hi"], fillcolor="rgba(239,68,68,.22)", line_width=0,
-                      annotation_text=f"ASK wall {_usd(w['usd'])} (z {w['z']:.1f})",
+                      annotation_text=f"ASK wall {_usd(w['usd'])} (z {w['z']:.1f}){_pers(w)}",
                       annotation_position="top left", annotation_font_color="#ef4444")
     return fig
 
 # ── Footprint-style volume at price from recent trades (crypto) ──────────────
-def get_trades(src, sym):
+def get_trades_raw(src, sym):
     """[(price, qty, taker_is_buy)] for the most recent trades, or None.
     Bybit spot recent-trade is capped at ~60 rows, so the linear perp (up to 1000) is tried first."""
     try:
@@ -894,6 +992,9 @@ def get_trades(src, sym):
     except Exception:
         pass
     return None
+    
+def get_trades(src, sym):
+    return _ttl(("__tr__", src, sym), 10, lambda: _get_trades_raw(src, sym))
 
 def footprint(src, sym, bins=40, imb_ratio=3.0):
     """Buy/sell volume per price bucket from the latest trades (a mini footprint).
@@ -994,12 +1095,16 @@ def enrich_rows(market, src, syms, tf, n_break, vol_mult, live, oi_lb, fh_key):
             out["Breakout"] = breakout_signal(cdf, n_break, vol_mult, live) or "n/a"
             cs = crash_score(cdf, live)
             out["Crash"] = cs[0] if cs else None
-            out["Flow"] = flow_text(volume_flow(cdf, live))
+            fl = volume_flow(cdf, live)
+            out["Flow"] = flow_text(fl)
+            out["_dz"] = fl[2] if fl else None
             if not stocks:
                 out["OI"] = oi_signal(s, tf, cdf, oi_lb, live)
                 try:
                     px = float(cdf["close"].iloc[-1])
-                    out["Book"] = book_label(orderbook_levels(src, s, px, float(atr(cdf).iloc[-1])), px)
+                    lv_ = orderbook_levels(src, s, px, float(atr(cdf).iloc[-1]))
+                    out["Book"] = book_label(lv_, px)
+                    out["_imb"] = lv_["imbalance_w"] if lv_ else None
                 except Exception:
                     out["Book"] = "n/a"
         except Exception:
@@ -1170,6 +1275,12 @@ if extras_on:
             df[col] = df["Symbol"].map(lambda s, c=col: extra.get(s, {}).get(c))
     if "Crash" in df.columns:
         df["Crash"] = pd.to_numeric(df["Crash"], errors="coerce")
+    if extra:
+        long_bias = rules_direction(rules)
+        st_map = dict(zip(df["Symbol"], df["Status"]))
+        df["Conviction"] = df["Symbol"].map(
+    lambda s: conviction(extra[s], long_bias, st_map.get(s), regime)[0] if s in extra else None)
+
     as_map = {s: v.get("_as") for s, v in extra.items()}
 
     def keep(frame):
@@ -1189,6 +1300,10 @@ if extras_on:
     n_before = len(match) + len(watch)
     match, watch = keep(match), keep(watch)
     hidden = n_before - len(match) - len(watch)
+    if "Conviction" in df.columns:
+        match = match.sort_values("Conviction", ascending=False, na_position="last")
+        watch = watch.sort_values("Conviction", ascending=False, na_position="last")
+
 
 m1, m2, m3, m4, m5 = st.columns(5)
 m1.metric("Scanned", len(df))
@@ -1219,6 +1334,9 @@ pct_cols = {c: st.column_config.NumberColumn(c, format="%.2f%%") for c in df.col
 cfg = {"Price": st.column_config.NumberColumn("Price", format="%.6g"), **pct_cols}
 if "Crash" in df.columns:
     cfg["Crash"] = st.column_config.ProgressColumn("Crash risk", min_value=0, max_value=100, format="%d")
+if "Conviction" in df.columns:
+    cfg["Conviction"] = st.column_config.ProgressColumn("Conviction", min_value=0, max_value=100, format="%d")
+
 t1, t2, t3, t4 = st.tabs(["✅ MATCH", "👀 WATCH", "All", "🎯 Trade planner"])
 for key, tab, data in (("match", t1, match), ("watch", t2, watch), ("all", t3, df)):
     with tab:
@@ -1239,13 +1357,17 @@ with t4:
         sym = k1.selectbox("Symbol", pool, format_func=lambda s: f"{'🟢' if s in now else '👀'} {s}")
         ctf = k2.selectbox("Chart / entry TF", TFS, index=2)
         dirn = k3.selectbox("Direction", ["Auto", "Long", "Short"])
-        sl_mode = k4.selectbox("Stop-loss", ["ATR", "Swing (10 bars)"])
+        sl_mode = k4.selectbox("Stop-loss", ["ATR", "Swing (10 bars)", "Wall invalidation"])
         k5, k6, k7, k8 = st.columns(4)
         atr_mult = k5.number_input("ATR multiple", 0.5, 10.0, 1.5, 0.25)
         rr_txt = k6.text_input("TP in R (TP1,TP2,TP3)", "1,2,3")
         horizon = k7.slider("MC horizon (bars)", 10, 200, 60, 5)
         n_paths = k8.select_slider("MC paths", [1000, 2000, 5000, 10000], 5000)
         k9, k10, k11 = st.columns(3)
+        k12, k13 = st.columns(2)
+        entry_mode = k12.selectbox("Entry", ["Market", "Wall limit"],
+                                   help="Wall limit = rest an order just in front of the strongest wall.")
+        cost_bps = k13.number_input("Round-trip cost (bps, fees + slippage)", 0.0, 200.0, 2.0 if is_stocks else 15.0, 1.0)
         drift = k9.toggle("Include historical drift", True)
         equity = k10.number_input(f"Account size ({ccy})", 10.0, 1e9, 1000.0, 100.0)
         risk_pct = k11.number_input("Risk per trade (%)", 0.1, 10.0, 1.0, 0.1)
@@ -1271,25 +1393,49 @@ with t4:
                        ("Long" if p > e200 else "Short")
                 direction = auto if dirn == "Auto" else dirn
                 long = direction == "Long"
-                entry, sl, tps, risk = trade_plan(cdf, direction, sl_mode, atr_mult, rr)
-                if not np.isfinite(risk) or risk <= entry * 1e-6:
-                    raise ValueError("Stop distance is ~0 (flat candles / bad ATR). Try another SL mode or TF.")
+                px_last = float(cdf["close"].iloc[-1])
+                lv = None
+                if not is_stocks:
+                    try:
+                        lv = orderbook_levels(data_src, sym, px_last, float(atr(cdf).iloc[-1]))
+                    except Exception:
+                        lv = None
+                sug = (lv["long_entry"] if long else lv["short_entry"]) if lv else None
+                limit_px = sug["entry"] if (sug and entry_mode == "Wall limit") else None
+                if entry_mode == "Wall limit" and not sug:
+                    st.caption("No wall found on this side: using market entry.")
+                entry, sl, tps, risk = trade_plan(cdf, direction, sl_mode, atr_mult, rr, entry=limit_px)
+                if sl_mode == "Wall invalidation" and sug:
+                    sl = sug.get("invalid_below") or sug.get("invalid_above")
+                    risk = abs(entry - sl)
+                    tps = [entry + (1 if long else -1) * risk * r for r in rr]
+                if not np.isfinite(risk) or risk <= entry * 1e-6 or (long and sl >= entry) or (not long and sl <= entry):
+                    raise ValueError("Stop is ~0 or on the wrong side of the entry. Try another SL mode / entry / TF.")
                 mc = monte_carlo(cdf["close"].values, entry, sl, tps, rr, long, horizon, n_paths, drift)
+                cost_r = cost_bps / 1e4 * entry / risk
+                ev_net = mc["ev_r"] - cost_r
+                fillp = fill_prob(cdf["close"].values, px_last, limit_px, long, horizon) if limit_px else None
+                exs = extra.get(sym, {})
+                fl = volume_flow(cdf, live)
+                bo = breakout_signal(cdf, n_break, vol_mult, live)
+                cs = crash_score(cdf, live)
+                ex_live = {"Breakout": bo, "Crash": cs[0] if cs else None, "OI": exs.get("OI"),
+                           "_dz": fl[2] if fl else None, "_imb": lv["imbalance_w"] if lv else None,
+                           "_as": exs.get("_as")}
+                cv, parts = conviction(ex_live, long, "MATCH" if sym in now else "WATCH", regime)
+                blocked = blocked_tps(lv, entry, tps, long)
                 qty = (equity * risk_pct / 100) / risk
                 if is_stocks:
-                    qty = float(int(qty))          # whole shares
+                    qty = float(int(qty))
                 pos_txt = f"{qty:,.0f} shares" if is_stocks else f"{qty:,.4f} {sym[:-4]}"
 
                 left, right = st.columns([3, 1.1])
                 fig = build_chart(cdf, lf, ls, entry, sl, tps, mc, ctf, long)
-                lv = None
-                if not is_stocks:
-                    try:
-                        lv = orderbook_levels(data_src, sym, float(entry), float(atr(cdf).iloc[-1]))
-                    except Exception:
-                        lv = None
                 if lv:
                     add_walls(fig, lv)
+                if sug and limit_px is None:
+                    fig.add_hline(y=sug["entry"], line_dash="dot", line_color="#38bdf8",
+                                  annotation_text="wall limit", annotation_position="bottom right")
                 left.plotly_chart(fig, width="stretch")
                 with right:
                     st.markdown(f"### {sym} · {'🟢 LONG' if long else '🔴 SHORT'}")
@@ -1305,6 +1451,15 @@ with t4:
                     st.metric("P(SL before any TP)", f"{mc['p_sl']*100:.0f}%")
                     st.metric("Expected value (R)", f"{mc['ev_r']:+.2f}R",
                               help="1/3 of the position exits at each TP; leftovers marked at horizon end.")
+                    st.metric("Net EV after costs", f"{ev_net:+.2f}R", f"costs {cost_r:.2f}R", delta_color="off")
+                    st.metric("Setup grade", f"{grade(cv)} · {cv}/100",
+                              help=" · ".join(f"{k} {v:+.0f}" for k, v in parts.items()))
+                    if fillp is not None:
+                        st.metric("Limit fill chance", f"{fillp * 100:.0f}%",
+                                  f"EV per signal {fillp * ev_net:+.2f}R", delta_color="off")
+                    for i, w in blocked:
+                        st.caption(f"⚠️ TP{i} sits behind a {_usd(w['usd'])} "
+                                   f"{'ask' if long else 'bid'} wall @ {fmt(w['price'])}")
                     st.metric("Median / 5–95% range",
                               f"{fmt(mc['median'])}", f"{fmt(mc['p5'])} – {fmt(mc['p95'])}", delta_color="off")
                     st.metric("Position size", pos_txt,
@@ -1320,16 +1475,9 @@ with t4:
                     elif is_stocks:
                         nodes = volume_nodes(cdf)
                         st.metric("Volume POC (support/resist.)", fmt(nodes[0][0]))
-                    fl = volume_flow(cdf, live)
-                    if fl:
-                        st.metric(f"Volume flow ({ctf})", fl[0], f"vz {fl[1]:+.1f} · dz {fl[2]:+.1f}",
-                                  delta_color="off")
-                    bo = breakout_signal(cdf, n_break, vol_mult, live)
-                    cs = crash_score(cdf, live)
                     st.metric(f"Breakout ({ctf})", bo or "n/a")
                     st.metric(f"Crash risk ({ctf})", f"{cs[0]}/100" if cs else "n/a",
                               help=cs[1] if cs else None)
-                    exs = extra.get(sym, {})
                     if exs.get("OI"):
                         st.metric(f"Open interest ({sig_tf})", exs["OI"])
                     if exs.get("Analyst"):

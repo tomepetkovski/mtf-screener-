@@ -717,6 +717,306 @@ def market_regime(market, src):
     cs = crash_score(df, True)
     state = "RISK-OFF" if p < e200 else ("CAUTION" if p < e50 else "RISK-ON")
     return {"sym": sym, "state": state, "d200": (p / e200 - 1) * 100, "crash": cs[0] if cs else None}
+# ════════════════════════════════════════════════════════════════
+# ADD-ONS for MTF EMA Screener Pro
+# Paste this block right AFTER the "Extra signals" section (after market_regime)
+# and BEFORE the "Sidebar" section. It reuses: fetch, BN, BY, OK, atr, np, pd, go,
+# _store, _CACHE_LOCK, _analyst_label.
+# ════════════════════════════════════════════════════════════════
+
+# ── 1. Volume flow: how unusual is volume, and which side is it on? ──────────
+def _robust_z(x, window=50):
+    """z-score of the last value vs the previous `window` values using median/MAD.
+    Volume is heavy-tailed, so mean/std z-scores are dominated by one spike."""
+    s = np.asarray(x, dtype="float64")
+    s = s[np.isfinite(s)]
+    if len(s) < window + 2:
+        return 0.0
+    ref = s[-window - 1:-1]
+    med = np.median(ref)
+    mad = np.median(np.abs(ref - med)) * 1.4826
+    if mad <= 1e-12:
+        mad = float(ref.std()) or 1.0
+    return float((s[-1] - med) / mad)
+
+def volume_flow(df, live=True, window=50, k=3):
+    """Returns (label, vol_z, delta_z) or None.
+    vol_z   = robust z of log-volume (is volume unusually high/low?)
+    delta_z = robust z of the k-bar net 'delta proxy' (is that volume buying or selling?)
+    delta proxy per bar = volume * CLV, CLV = (2C - H - L)/(H - L) in [-1, +1].
+    (Exact buy/sell volume needs taker data: Binance klines column 9 'taker buy base volume'.)"""
+    d = df if live else df.iloc[:-1]
+    if len(d) < window + k + 5:
+        return None
+    rng = (d["high"] - d["low"]).replace(0, np.nan)
+    clv = ((2 * d["close"] - d["high"] - d["low"]) / rng).fillna(0.0)
+    delta = clv * d["volume"]
+    vz = _robust_z(np.log1p(d["volume"].values), window)
+    dz = _robust_z(delta.rolling(k).sum().dropna().values, window)
+    if vz >= 1.5 and dz >= 1.0:
+        lab = "🟢 buy surge"
+    elif vz >= 1.5 and dz <= -1.0:
+        lab = "🔴 sell surge"
+    elif dz >= 1.5:
+        lab = "🟢 accumulation"
+    elif dz <= -1.5:
+        lab = "🔴 distribution"
+    elif vz <= -1.0:
+        lab = "💤 volume dry-up"
+    else:
+        lab = "➖ neutral"
+    return lab, vz, dz
+
+def flow_text(f):
+    return "n/a" if not f else f"{f[0]} (vz {f[1]:+.1f} · dz {f[2]:+.1f})"
+
+# ── 2. Order-book walls (crypto only: stocks have no free L2 feed) ───────────
+def _lv(rows):
+    return [(float(x[0]), float(x[1])) for x in rows]
+
+def get_orderbook(src, sym):
+    """(bids, asks) as [(price, qty)], or None."""
+    try:
+        if src == "binance":
+            d = fetch(BN, "/api/v3/depth", {"symbol": sym, "limit": 1000})
+            return _lv(d["bids"]), _lv(d["asks"])
+        if src == "bybit":
+            d = fetch(BY, "/v5/market/orderbook", {"category": "spot", "symbol": sym, "limit": 200})["result"]
+            return _lv(d["b"]), _lv(d["a"])
+        if src == "okx":
+            d = fetch(OK, "/api/v5/market/books", {"instId": sym[:-4] + "-USDT", "sz": 400})["data"][0]
+            return _lv(d["bids"]), _lv(d["asks"])
+    except Exception:
+        pass
+    return None
+
+def _usd(x):
+    return f"${x / 1e6:.1f}M" if x >= 1e6 else f"${x / 1e3:.0f}k"
+
+def orderbook_levels(src, sym, price, atr_abs=0.0, band=0.03, bins=40, z=3.0):
+    """Bucket resting orders (USD notional) around price and flag buckets that are
+    statistical outliers (robust z >= z) as walls. Also returns book imbalance within +-1%
+    and a wall-based limit-entry suggestion."""
+    ob = get_orderbook(src, sym)
+    if not ob or not ob[0] or not ob[1]:
+        return None
+    bids, asks = ob
+    # depth snapshots only cover a limited range on liquid coins: never bucket beyond what we have
+    lo = max(price * (1 - band), min(p for p, _ in bids))
+    hi = min(price * (1 + band), max(p for p, _ in asks))
+    if hi <= lo:
+        return None
+    edges = np.linspace(lo, hi, bins + 1)
+    mid = (edges[:-1] + edges[1:]) / 2
+
+    def bucket(levels):
+        arr = np.array([(p, p * q) for p, q in levels if lo <= p <= hi])
+        if arr.size == 0:
+            return np.zeros(bins)
+        idx = np.clip(np.searchsorted(edges, arr[:, 0], side="right") - 1, 0, bins - 1)
+        return np.bincount(idx, weights=arr[:, 1], minlength=bins)
+
+    b, a = bucket(bids), bucket(asks)
+    allv = np.concatenate([b, a])
+    nz = allv[allv > 0]
+    if len(nz) < 8:
+        return None
+    med = float(np.median(nz))
+    mad = float(np.median(np.abs(nz - med)) * 1.4826) or float(nz.std()) or 1.0
+
+    def walls(arr):
+        out, used = [], []
+        for i in np.argsort(arr)[::-1]:
+            zs = (arr[i] - med) / mad
+            if zs < z or len(out) >= 3:
+                break
+            if any(abs(i - j) <= 1 for j in used):          # merge neighbouring buckets
+                continue
+            used.append(i)
+            out.append({"price": float(mid[i]), "lo": float(edges[i]), "hi": float(edges[i + 1]),
+                        "usd": float(arr[i]), "z": float(zs)})
+        return out
+
+    bw, aw = walls(b), walls(a)
+    near = lambda lv, side: sum(p * q for p, q in lv if abs(p / price - 1) <= 0.01)
+    B, A = near(bids, "b"), near(asks, "a")
+    imb = (B - A) / (B + A) if (B + A) > 0 else 0.0
+    buf = 0.1 * atr_abs
+    long_entry = short_entry = None
+    below = [w for w in bw if w["hi"] <= price * 1.001]
+    above = [w for w in aw if w["lo"] >= price * 0.999]
+    if below:
+        w = max(below, key=lambda x: x["usd"])
+        long_entry = {"entry": min(w["hi"] + buf, price), "invalid_below": w["lo"] - buf, "wall": w}
+    if above:
+        w = max(above, key=lambda x: x["usd"])
+        short_entry = {"entry": max(w["lo"] - buf, price), "invalid_above": w["hi"] + buf, "wall": w}
+    return {"bid_walls": bw, "ask_walls": aw, "imbalance": float(imb),
+            "long_entry": long_entry, "short_entry": short_entry}
+
+def book_label(lv, price):
+    if not lv:
+        return "n/a"
+    icon = "🟢" if lv["imbalance"] > 0.15 else "🔴" if lv["imbalance"] < -0.15 else "➖"
+    parts = [f"{icon} imb {lv['imbalance']:+.0%}"]
+    if lv["bid_walls"]:
+        w = max(lv["bid_walls"], key=lambda x: x["usd"])
+        parts.append(f"bid {_usd(w['usd'])} @ {(w['price'] / price - 1) * 100:+.1f}%")
+    if lv["ask_walls"]:
+        w = max(lv["ask_walls"], key=lambda x: x["usd"])
+        parts.append(f"ask {_usd(w['usd'])} @ {(w['price'] / price - 1) * 100:+.1f}%")
+    return " · ".join(parts)
+
+def add_walls(fig, lv):
+    """Draw the walls on the trade-planner chart."""
+    for w in lv["bid_walls"]:
+        fig.add_hrect(y0=w["lo"], y1=w["hi"], fillcolor="rgba(34,197,94,.22)", line_width=0,
+                      annotation_text=f"BID wall {_usd(w['usd'])} (z {w['z']:.1f})",
+                      annotation_position="bottom left", annotation_font_color="#22c55e")
+    for w in lv["ask_walls"]:
+        fig.add_hrect(y0=w["lo"], y1=w["hi"], fillcolor="rgba(239,68,68,.22)", line_width=0,
+                      annotation_text=f"ASK wall {_usd(w['usd'])} (z {w['z']:.1f})",
+                      annotation_position="top left", annotation_font_color="#ef4444")
+    return fig
+
+# ── 3. Footprint-style volume at price from recent trades (crypto) ───────────
+def get_trades(src, sym):
+    """[(price, qty, taker_is_buy)] for the most recent ~500-1000 trades, or None."""
+    try:
+        if src == "binance":
+            d = fetch(BN, "/api/v3/aggTrades", {"symbol": sym, "limit": 1000})
+            return [(float(t["p"]), float(t["q"]), not t["m"]) for t in d]   # m=True -> seller was taker
+        if src == "bybit":
+            d = fetch(BY, "/v5/market/recent-trade", {"category": "spot", "symbol": sym, "limit": 1000})
+            return [(float(t["price"]), float(t["size"]), t["side"] == "Buy") for t in d["result"]["list"]]
+        if src == "okx":
+            d = fetch(OK, "/api/v5/market/trades", {"instId": sym[:-4] + "-USDT", "limit": 500})
+            return [(float(t["px"]), float(t["sz"]), t["side"] == "buy") for t in d["data"]]
+    except Exception:
+        pass
+    return None
+
+def footprint(src, sym, bins=40, imb_ratio=3.0):
+    """Buy/sell volume per price bucket from the latest trades (a mini footprint).
+    Returns (DataFrame[price, buy, sell, delta, total, imbalance], poc_price, cvd) or None."""
+    tr = get_trades(src, sym)
+    if not tr or len(tr) < 50:
+        return None
+    p = np.array([t[0] for t in tr]); q = np.array([t[1] for t in tr])
+    isb = np.array([t[2] for t in tr])
+    lo, hi = p.min(), p.max()
+    if hi <= lo:
+        return None
+    edges = np.linspace(lo, hi, bins + 1)
+    idx = np.clip(np.searchsorted(edges, p, side="right") - 1, 0, bins - 1)
+    buy = np.bincount(idx, weights=q * isb, minlength=bins)
+    sell = np.bincount(idx, weights=q * ~isb, minlength=bins)
+    fp = pd.DataFrame({"price": (edges[:-1] + edges[1:]) / 2, "buy": buy, "sell": sell})
+    fp["delta"], fp["total"] = fp["buy"] - fp["sell"], fp["buy"] + fp["sell"]
+    fp["imbalance"] = np.where(fp["buy"] >= imb_ratio * fp["sell"].clip(lower=1e-12), "BUY",
+                      np.where(fp["sell"] >= imb_ratio * fp["buy"].clip(lower=1e-12), "SELL", ""))
+    return fp, float(fp.loc[fp["total"].idxmax(), "price"]), float(fp["delta"].sum())
+
+def footprint_chart(fp, poc, entry=None):
+    fig = go.Figure()
+    h = (fp["price"].iloc[1] - fp["price"].iloc[0]) * 0.9
+    fig.add_trace(go.Bar(y=fp["price"], x=fp["buy"], orientation="h", name="Aggressive buy",
+                         marker_color="#22c55e", width=h))
+    fig.add_trace(go.Bar(y=fp["price"], x=-fp["sell"], orientation="h", name="Aggressive sell",
+                         marker_color="#ef4444", width=h))
+    fig.add_hline(y=poc, line_dash="dot", line_color="#f59e0b", annotation_text="POC")
+    if entry:
+        fig.add_hline(y=entry, line_color="#3b82f6", annotation_text="ENTRY")
+    fig.update_layout(barmode="relative", template="plotly_dark", height=420,
+                      margin=dict(l=10, r=10, t=30, b=10), title="Volume at price (buy right / sell left)")
+    return fig
+
+# ── 4. Stocks: no free order book -> high-volume nodes as proxy walls ────────
+def volume_nodes(df, bins=40, top=3):
+    """Volume-at-price from candles (typical price). POC + top high-volume nodes act as
+    support/resistance. A proxy only: it is traded volume, not resting orders."""
+    d = df.iloc[-300:]
+    tp = ((d["high"] + d["low"] + d["close"]) / 3).values
+    hist, edges = np.histogram(tp, bins=bins, weights=d["volume"].values)
+    mid = (edges[:-1] + edges[1:]) / 2
+    order = np.argsort(hist)[::-1]
+    nodes, used = [], []
+    for i in order:
+        if any(abs(i - j) <= 1 for j in used):
+            continue
+        used.append(i)
+        nodes.append((float(mid[i]), float(hist[i])))
+        if len(nodes) >= top:
+            break
+    return nodes          # first = POC
+
+# ── 5. Analyst rating WITH direction (upgrade / downgrade trend) ─────────────
+def _analyst_trend(d):
+    """Latest Finnhub recommendation vs the previous month: label gets ▲ / ▼ when
+    the consensus score moved by >= 0.15 (on the -2..+2 scale)."""
+    rows = sorted(d, key=lambda r: r.get("period", ""), reverse=True)
+    label, sc = _analyst_label(rows[0])
+    if sc is None or len(rows) < 2:
+        return label, sc
+    _, prev = _analyst_label(rows[1])
+    if prev is not None:
+        if sc - prev >= 0.15:
+            label += " ▲"
+        elif sc - prev <= -0.15:
+            label += " ▼"
+    return label, sc
+
+# ════════════════════════════════════════════════════════════════
+# INTEGRATION (edit the existing code as follows)
+# ════════════════════════════════════════════════════════════════
+#
+# A) analyst_rating(): replace the line
+#        res = _analyst_label(max(d, key=lambda r: r.get("period", ""))) if d else ("n/a", None)
+#    with
+#        res = _analyst_trend(d) if d else ("n/a", None)
+#
+# B) enrich_rows() -> inside one(s), after `out["Crash"] = ...`:
+#        out["Flow"] = flow_text(volume_flow(cdf, live))
+#        if not stocks:
+#            px = float(cdf["close"].iloc[-1])
+#            out["Book"] = book_label(orderbook_levels(src, s, px, float(atr(cdf).iloc[-1])), px)
+#    (the order-book call is one extra request per MATCH/WATCH row; results are cached 5 min)
+#
+# C) In the "Extra signals" merge loop, add the new columns:
+#        for col in ("Breakout", "Crash", "OI", "Analyst", "Flow", "Book"):
+#
+# D) Trade planner, replace the `left.plotly_chart(build_chart(...))` line with:
+#        fig = build_chart(cdf, lf, ls, entry, sl, tps, mc, ctf, long)
+#        lv = None if is_stocks else orderbook_levels(data_src, sym, entry, float(atr(cdf).iloc[-1]))
+#        if lv:
+#            add_walls(fig, lv)
+#        left.plotly_chart(fig, width="stretch")
+#
+#    and inside `with right:` (after the Position size metric):
+#        if lv:
+#            st.metric("Book imbalance (±1%)", f"{lv['imbalance']:+.0%}")
+#            sug = lv["long_entry"] if long else lv["short_entry"]
+#            if sug:
+#                inv = sug.get("invalid_below") or sug.get("invalid_above")
+#                st.metric("Wall-based limit entry", fmt(sug["entry"]),
+#                          f"{_usd(sug['wall']['usd'])} wall · invalid beyond {fmt(inv)}", delta_color="off")
+#        elif is_stocks:
+#            nodes = volume_nodes(cdf)
+#            st.metric("Volume POC (support/resist.)", fmt(nodes[0][0]))
+#        fl = volume_flow(cdf, live)
+#        if fl:
+#            st.metric(f"Volume flow ({ctf})", fl[0], f"vz {fl[1]:+.1f} · dz {fl[2]:+.1f}", delta_color="off")
+#
+# E) Footprint, after the final st.caption(...) lines inside the try-block:
+#        if not is_stocks:
+#            with st.expander("🦶 Footprint: volume at price (last ~1000 trades)"):
+#                res_fp = footprint(data_src, sym)
+#                if res_fp:
+#                    fp, poc, cvd = res_fp
+#                    st.plotly_chart(footprint_chart(fp, poc, entry), width="stretch")
+#                    st.caption(f"Net aggressive delta: {cvd:+,.2f} · POC {fmt(poc)}")
+#                else:
+#                    st.info("No recent trade data available for this symbol.")
 
 # ── Sidebar ─────────────────────────────────────────────────────
 st.sidebar.header("⚙️ Settings")

@@ -1,5 +1,9 @@
+import json
+import os
+import sqlite3
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from functools import partial
 from urllib.parse import quote
 
@@ -86,6 +90,12 @@ CLOSES_KEPT = 700       # enough warm-up for EMA200, keeps the cache small
 ENRICH_MAX = 150        # extra signals are computed for at most this many MATCH/WATCH rows
 ANALYST_MAX = 100       # Finnhub free tier = 60 calls/min; results are cached for 24h
 ANALYST_MIN = {"Hold+": -0.4, "Buy+": 0.4, "Strong Buy": 1.2}
+
+# FOMC decision times (UTC), checked against the Federal Reserve calendar. Add CPI / NFP / token unlocks etc.
+# in the sidebar text box: one event per line, "YYYY-MM-DD HH:MM label" (UTC).
+DEFAULT_MACRO = "2026-10-28 18:00 FOMC decision\n2026-12-09 19:00 FOMC decision"
+
+JOURNAL_DB = os.environ.get("JOURNAL_DB", "signal_journal.db")
 
 # ── HTTP ────────────────────────────────────────────────────────
 def fetch(bases, path, params=None, retries=2, headers=None):
@@ -287,6 +297,7 @@ _SHARED = _store()
 # Shared cache is written by many worker threads -> guard with a lock and prune it.
 _CACHE_LOCK = threading.Lock()
 _FH_LOCK = threading.Lock()          # serialises Finnhub calls (rate limit)
+_DB_LOCK = threading.Lock()          # serialises journal writes
 _CACHE_MAX = 20000
 
 def get_closes(store, name, sym, tf, ttl=90):
@@ -737,6 +748,7 @@ def volume_flow(df, live=True, window=50, k=3):
 
 def flow_text(f):
     return "n/a" if not f else f"{f[0]} (vz {f[1]:+.1f} · dz {f[2]:+.1f})"
+
 def rules_direction(rules):
     """True = the rule set is long-biased (Above / 50>200), False = short-biased."""
     up = dn = 0
@@ -745,9 +757,197 @@ def rules_direction(rules):
         dn += (a == "Below") + (b == "Below") + (c == "50<200")
     return up >= dn
 
-def conviction(ex, long, status, regime):
+# ── NEW: positioning (funding · long/short ratio · basis) — crypto perps ─────
+BY_LS = {"15m": "15min", "1h": "1h", "4h": "4h", "1d": "1d", "1w": "1d"}
+BN_LS = {"15m": "15m", "1h": "1h", "4h": "4h", "1d": "1d", "1w": "1d"}
+
+def _pct_rank(hist, x):
+    h = [v for v in (hist or []) if v is not None and np.isfinite(v)]
+    if len(h) < 10:
+        return None
+    return float(sum(v <= x for v in h) / len(h))
+
+def _clip(x, lo=-1.0, hi=1.0):
+    return float(max(lo, min(hi, x)))
+
+def _funding_raw(sym):
+    """{'rate','hist','basis%'} from the USDT perpetual: Bybit first, Binance futures as fallback."""
+    rate = hist = basis = None
+    d = fetch(BY, "/v5/market/tickers", {"category": "linear", "symbol": sym}, retries=1)
+    try:
+        it = d["result"]["list"][0]
+        rate = float(it["fundingRate"])
+        idx, last = float(it.get("indexPrice") or 0), float(it.get("lastPrice") or 0)
+        if idx > 0 and last > 0:
+            basis = (last / idx - 1) * 100
+    except Exception:
+        rate = None
+    if rate is not None:
+        h = fetch(BY, "/v5/market/funding/history", {"category": "linear", "symbol": sym, "limit": 200}, retries=1)
+        try:
+            hist = [float(x["fundingRate"]) for x in h["result"]["list"]]
+        except Exception:
+            hist = None
+    else:
+        d = fetch(BN_F, "/fapi/v1/premiumIndex", {"symbol": sym}, retries=1)
+        try:
+            rate = float(d["lastFundingRate"])
+            mark, idx = float(d["markPrice"]), float(d["indexPrice"])
+            basis = (mark / idx - 1) * 100 if idx > 0 else None
+        except Exception:
+            rate = None
+        if rate is not None:
+            h = fetch(BN_F, "/fapi/v1/fundingRate", {"symbol": sym, "limit": 200}, retries=1)
+            try:
+                hist = [float(x["fundingRate"]) for x in h]
+            except Exception:
+                hist = None
+    return None if rate is None else {"rate": rate, "hist": hist, "basis": basis}
+
+def _ls_raw(sym, tf):
+    """(current long share 0..1, history of long shares oldest->newest) or None."""
+    d = fetch(BY, "/v5/market/account-ratio",
+              {"category": "linear", "symbol": sym, "period": BY_LS[tf], "limit": 200}, retries=1)
+    try:
+        vals = [float(x["buyRatio"]) for x in reversed(d["result"]["list"])]
+        if len(vals) >= 3:
+            return vals[-1], vals
+    except Exception:
+        pass
+    d = fetch(BN_F, "/futures/data/globalLongShortAccountRatio",
+              {"symbol": sym, "period": BN_LS[tf], "limit": 200}, retries=1)
+    try:
+        vals = [float(x["longAccount"]) for x in d]
+        if len(vals) >= 3:
+            return vals[-1], vals
+    except Exception:
+        pass
+    return None
+
+def positioning(sym, tf):
+    """Crowding read: funding + long/short account ratio (+ perp basis).
+    '_crowd' in -1..+1: + = longs crowded (late-long / squeeze-down risk), - = shorts crowded."""
+    out = {"Funding": "n/a", "L/S": "n/a", "Crowding": "n/a", "_crowd": None}
+    fr = _ttl(("__fr__", sym), 300, lambda: _funding_raw(sym))
+    ls = _ttl(("__ls__", sym, tf), 300, lambda: _ls_raw(sym, tf))
+    scores = []
+    if fr:
+        r = fr["rate"] * 100                                   # % per funding interval
+        pr = _pct_rank(fr["hist"], fr["rate"])
+        s = _clip(r / 0.05)                                    # 0.05% per 8h is already very hot
+        if pr is not None:
+            s = 0.5 * s + 0.5 * (2 * pr - 1)
+        scores.append(s)
+        icon = "🔥" if s >= 0.5 else "🧊" if s <= -0.5 else "➖"
+        txt = f"{icon} {r:+.4f}%"
+        if pr is not None:
+            txt += f" (p{pr * 100:.0f})"
+        if fr.get("basis") is not None:
+            txt += f" · basis {fr['basis']:+.2f}%"
+        out["Funding"] = txt
+    if ls:
+        lp, hist = ls
+        pr = _pct_rank(hist, lp)
+        s = _clip((lp - 0.5) / 0.15)
+        if pr is not None:
+            s = 0.5 * s + 0.5 * (2 * pr - 1)
+        scores.append(s)
+        icon = "🔥" if s >= 0.5 else "🧊" if s <= -0.5 else "➖"
+        out["L/S"] = f"{icon} {lp * 100:.0f}% long" + (f" (p{pr * 100:.0f})" if pr is not None else "")
+    if scores:
+        crowd = float(np.mean(scores))
+        out["_crowd"] = crowd
+        out["Crowding"] = ("🔥 longs crowded" if crowd >= 0.5 else
+                           "🧊 shorts crowded" if crowd <= -0.5 else "➖ balanced")
+    return out
+
+# ── NEW: relative strength vs benchmark ──────────────────────────────────────
+def rel_strength(closes, bench, lb, live):
+    """Asset return minus benchmark return over lb daily bars, in percentage points."""
+    idx = -1 if live else -2
+    if not closes or not bench or len(closes) < lb + abs(idx) or len(bench) < lb + abs(idx):
+        return None
+    ra = closes[idx] / closes[idx - lb] - 1
+    rb = bench[idx] / bench[idx - lb] - 1
+    return (ra - rb) * 100
+
+# ── NEW: earnings calendar (stocks) + macro events + macro strip ─────────────
+def earnings_calendar(key, days=14):
+    """{symbol: (date 'YYYY-MM-DD', hour)} for the next `days` days from Finnhub (one call, cached 6h)."""
+    k = ("__earn__",)
+    with _CACHE_LOCK:
+        hit = _SHARED.get(k)
+    if hit and time.time() - hit[0] < 21600:
+        return hit[1]
+    today = datetime.now(timezone.utc).date()
+    d = fetch(FH, "/api/v1/calendar/earnings",
+              {"from": today.isoformat(), "to": (today + timedelta(days=days)).isoformat(), "token": key})
+    rows = d.get("earningsCalendar") if isinstance(d, dict) else None
+    if rows is None:
+        return None                                          # error / no access: do not cache
+    out = {}
+    for r in rows:
+        s, dt = _clean_sym(r.get("symbol")), r.get("date")
+        if s and dt and (s not in out or dt < out[s][0]):
+            out[s] = (dt, r.get("hour") or "")
+    with _CACHE_LOCK:
+        _SHARED[k] = (time.time(), out)
+    return out
+
+def earn_info(cal, s):
+    """(label, days_to_earnings or None)."""
+    if cal is None:
+        return "n/a (no key)", None
+    e = cal.get(s)
+    if not e:
+        return "-", None
+    try:
+        days = (datetime.strptime(e[0], "%Y-%m-%d").date() - datetime.now(timezone.utc).date()).days
+    except Exception:
+        return "n/a", None
+    if days < 0:
+        return "-", None
+    when = "today" if days == 0 else f"in {days}d"
+    tag = f" ({e[1]})" if e[1] else ""
+    return f"{'⚠️' if days <= 3 else '📅'} {when}{tag}", days
+
+def parse_macro(txt):
+    ev = []
+    for ln in (txt or "").splitlines():
+        p = ln.strip().split(None, 2)
+        if len(p) < 2:
+            continue
+        try:
+            t = datetime.strptime(p[0] + " " + p[1], "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+        ev.append((t, p[2] if len(p) > 2 else "event"))
+    return sorted(ev)
+
+def next_macro(ev, horizon_h=48):
+    """(hours_until, name) for the nearest event within the horizon (events up to 1h old still count)."""
+    now = datetime.now(timezone.utc)
+    for t, name in ev:
+        h = (t - now).total_seconds() / 3600
+        if -1 <= h <= horizon_h:
+            return max(h, 0.0), name
+    return None
+
+@st.cache_data(ttl=600, show_spinner=False)
+def macro_snapshot():
+    """VIX, DXY, US10Y from Yahoo: (last, 1-day % change)."""
+    out = {}
+    for name, sym in (("VIX", "^VIX"), ("DXY", "DX-Y.NYB"), ("US10Y", "^TNX")):
+        rows, _ = _yahoo_chart(sym, "1d", "1mo")
+        if rows and len(rows) >= 2 and rows[-2][4]:
+            out[name] = (float(rows[-1][4]), (rows[-1][4] / rows[-2][4] - 1) * 100)
+    return out
+
+# ── Conviction score ─────────────────────────────────────────────
+def conviction(ex, long, status, regime, macro_h=None):
     """0-100 setup score + breakdown. Direction-aware: the same signal helps a long and hurts a short.
-    ex keys (all optional): Breakout, Crash, OI, _dz (flow z), _imb (weighted book imbalance), _as (analyst)."""
+    ex keys (all optional): Breakout, Crash, OI, _dz (flow z), _imb (book imbalance), _as (analyst),
+    _crowd (funding/LS crowding), _rs (relative strength), _ed (days to earnings). macro_h = hours to next macro event."""
     sg = 1 if long else -1
     clip = lambda x: max(-1.0, min(1.0, float(x)))
     ok = lambda v: v is not None and np.isfinite(v)
@@ -770,8 +970,32 @@ def conviction(ex, long, status, regime):
         p["Regime"] = sg * {"RISK-ON": 10, "CAUTION": 0, "RISK-OFF": -15}[regime["state"]]
     if ok(ex.get("_as")):
         p["Analyst"] = 6 * clip(sg * ex["_as"] / 1.2)
+    if ok(ex.get("_crowd")):                       # crowded IN your direction = late / squeeze risk
+        p["Crowd"] = -sg * 8 * clip(ex["_crowd"])
+    if ok(ex.get("_rs")):                          # leaders for longs, laggards for shorts
+        p["RelStr"] = sg * 8 * clip(ex["_rs"])
+    ed = ex.get("_ed")
+    if ok(ed):                                     # gap risk hurts both directions
+        p["Earnings"] = -20 if ed <= 1 else -10 if ed <= 3 else -3 if ed <= 7 else 0
+    if macro_h is not None:
+        p["Event"] = -12 if macro_h <= 6 else -6 if macro_h <= 24 else 0
     score = int(round(max(0, min(100, 50 + sum(p.values())))))
     return score, p
+
+DRIVER_HELP = {
+    "MTF": "Timeframe rules matched (MATCH = all, WATCH = all but one)",
+    "Flow": "Volume delta z-score: is unusual volume on your side?",
+    "Book": "Order-book imbalance near price, closer orders weigh more",
+    "OI": "Open interest vs price: who is building positions",
+    "Break": "Close beyond the recent range (volume / squeeze bonus)",
+    "Crash": "Crash-risk score (drawdown, volatility, heavy red bars, trend loss)",
+    "Regime": "BTC / SPY daily trend vs EMA50 / EMA200",
+    "Analyst": "Finnhub analyst consensus and trend",
+    "Crowd": "Funding + long/short ratio: crowded in your direction = negative",
+    "RelStr": "Return vs BTC / SPY over 1w and 4w",
+    "Earnings": "Earnings within 7 days = gap risk through your SL",
+    "Event": "Macro event (FOMC, CPI, ...) within 24h",
+}
 
 def grade(s):
     return "A" if s >= 80 else "B" if s >= 65 else "C" if s >= 50 else "D"
@@ -796,10 +1020,11 @@ def fill_prob(close, price, limit, long, horizon, n_paths=3000, seed=7):
     r = r - r.mean()
     paths = price * np.exp(np.cumsum(r[rng.integers(0, len(r), (n_paths, horizon))], axis=1))
     return float((paths.min(axis=1) <= limit).mean() if long else (paths.max(axis=1) >= limit).mean())
-    
+
 # ── Order-book walls (crypto only: stocks have no free L2 feed) ──────────────
 def _lv(rows):
     return [(float(x[0]), float(x[1])) for x in rows]
+
 def _ttl(key, ttl, fn):
     store, now = _SHARED, time.time()
     with _CACHE_LOCK:
@@ -834,7 +1059,7 @@ def _tag_persistence(bw, aw, src, sym, keep=6, min_gap=20, max_age=900):
 
 def _pers(w):
     return "" if w.get("persist") is None else f" · seen {w['persist']:.0%}"
-    
+
 def _get_orderbook_raw(src, sym):
     """(bids, asks) as [(price, qty)], or None."""
     try:
@@ -853,7 +1078,7 @@ def _get_orderbook_raw(src, sym):
 
 def _usd(x):
     return f"${x / 1e6:.1f}M" if x >= 1e6 else f"${x / 1e3:.0f}k"
-    
+
 def orderbook_levels(src, sym, price, atr_abs=0.0, band=0.03, bins=40, z=3.0):
     """Bucket resting orders (USD notional) around price and flag buckets that are
     statistical outliers (robust z >= z) as walls. Also returns book imbalance (over the range
@@ -934,7 +1159,7 @@ def orderbook_levels(src, sym, price, atr_abs=0.0, band=0.03, bins=40, z=3.0):
     above = [w for w in aw if w["lo"] >= price * 0.999]
     # prefer big walls, but penalise walls that are far away (less likely to be reached / fill)
     pw = lambda w: 1.0 if w.get("persist") is None else 0.5 + 0.5 * w["persist"]
-    score = lambda w: w["usd"] * pw(w) / (1 + 100 * abs(w["price"] / price - 1))   # <- replaces old score
+    score = lambda w: w["usd"] * pw(w) / (1 + 100 * abs(w["price"] / price - 1))
     if below:
         w = max(below, key=score)
         long_entry = {"entry": min(w["hi"] + buf, price), "invalid_below": w["lo"] - buf, "wall": w}
@@ -992,7 +1217,7 @@ def _get_trades_raw(src, sym):
     except Exception:
         pass
     return None
-    
+
 def get_trades(src, sym):
     return _ttl(("__tr__", src, sym), 10, lambda: _get_trades_raw(src, sym))
 
@@ -1081,10 +1306,319 @@ def volume_nodes(df, bins=40, top=3):
             break
     return nodes          # first = POC
 
+# ── NEW: Signal journal (SQLite) — log MATCH signals, resolve outcomes, grade-vs-win-rate ──
+_JCOLS = ["ts", "market", "src", "symbol", "tf", "direction", "bar_t", "entry", "sl", "tp1", "tp2", "tp3",
+          "rr", "timeout", "conviction", "grade", "status", "parts", "extras"]
+_ALLCOLS = _JCOLS + ["outcome", "r_result", "closed_ts", "bars"]
+_SCHEMA = """CREATE TABLE IF NOT EXISTS signals(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, market TEXT, src TEXT, symbol TEXT, tf TEXT,
+    direction TEXT, bar_t INTEGER, entry REAL, sl REAL, tp1 REAL, tp2 REAL, tp3 REAL, rr TEXT,
+    timeout INTEGER, conviction INTEGER, grade TEXT, status TEXT, parts TEXT, extras TEXT,
+    outcome TEXT DEFAULT 'OPEN', r_result REAL, closed_ts REAL, bars INTEGER DEFAULT 0)"""
+
+def _db():
+    con = sqlite3.connect(JOURNAL_DB, timeout=10)
+    con.execute(_SCHEMA)
+    return con
+
+def _py(v):
+    """numpy / pandas scalars -> plain Python (sqlite cannot bind numpy types)."""
+    if v is None:
+        return None
+    if isinstance(v, float) and np.isnan(v):
+        return None
+    if hasattr(v, "item"):
+        try:
+            return v.item()
+        except Exception:
+            pass
+    return v
+
+def journal_plan(cdf, long, live, atr_mult, rr):
+    """Default plan used for auto-logging: entry = signal-TF close, ATR stop, TPs at R multiples."""
+    d = cdf if live else cdf.iloc[:-1]
+    if len(d) < 30:
+        return None
+    a = float(atr(d).iloc[-1])
+    entry = float(d["close"].iloc[-1])
+    if not np.isfinite(a) or a <= 0 or entry <= 0:
+        return None
+    sign = 1 if long else -1
+    sl = entry - sign * atr_mult * a
+    risk = abs(entry - sl)
+    return {"entry": entry, "sl": sl, "tps": [entry + sign * risk * r for r in rr], "rr": list(rr),
+            "bar_t": int(pd.Timestamp(d["t"].iloc[-1]).timestamp() * 1000)}
+
+def extras_json(ex, regime):
+    keys = ("Breakout", "Crash", "Flow", "OI", "Book", "Funding", "L/S", "Crowding", "Earnings", "Analyst")
+    d = {k: ex.get(k) for k in keys if ex.get(k) is not None}
+    for k in ("RS 1w %", "RS 4w %"):
+        if ex.get(k) is not None:
+            d[k] = ex[k]
+    if regime:
+        d["Regime"] = regime["state"]
+    return json.dumps(d, default=str)
+
+def journal_insert(rec, cooldown_h=24):
+    """Insert one signal unless the same symbol/direction is still OPEN or was logged within cooldown_h."""
+    try:
+        with _DB_LOCK:
+            con = _db()
+            try:
+                dup = con.execute(
+                    "SELECT 1 FROM signals WHERE market=? AND symbol=? AND direction=? "
+                    "AND (outcome='OPEN' OR ts>?) LIMIT 1",
+                    (rec["market"], rec["symbol"], rec["direction"], time.time() - cooldown_h * 3600)).fetchone()
+                if dup:
+                    return False
+                con.execute(f"INSERT INTO signals({','.join(_JCOLS)}) VALUES({','.join('?' * len(_JCOLS))})",
+                            [_py(rec.get(c)) for c in _JCOLS])
+                con.commit()
+                return True
+            finally:
+                con.close()
+    except Exception:
+        return False
+
+def journal_load():
+    try:
+        with _DB_LOCK:
+            con = _db()
+            try:
+                return pd.read_sql_query("SELECT * FROM signals ORDER BY ts DESC", con)
+            finally:
+                con.close()
+    except Exception:
+        return pd.DataFrame()
+
+def journal_import(df):
+    """Restore from an exported CSV (skips rows that already exist)."""
+    n = 0
+    with _DB_LOCK:
+        con = _db()
+        try:
+            for r in df.to_dict("records"):
+                if con.execute("SELECT 1 FROM signals WHERE market=? AND symbol=? AND tf=? AND bar_t=? AND direction=?",
+                               (r.get("market"), r.get("symbol"), r.get("tf"), _py(r.get("bar_t")),
+                                r.get("direction"))).fetchone():
+                    continue
+                con.execute(f"INSERT INTO signals({','.join(_ALLCOLS)}) VALUES({','.join('?' * len(_ALLCOLS))})",
+                            [_py(r.get(c)) for c in _ALLCOLS])
+                n += 1
+            con.commit()
+        finally:
+            con.close()
+    return n
+
+def journal_clear():
+    with _DB_LOCK:
+        con = _db()
+        try:
+            con.execute("DELETE FROM signals")
+            con.commit()
+        finally:
+            con.close()
+
+def resolve_signal(row, df):
+    """Walk the candles after the signal bar. SL is checked before TPs on the same bar (conservative).
+    1/3 of the position exits at each TP, the SL stays fixed, leftovers are marked at the time stop.
+    Returns (label, r_result, bars) when closed, None while still open."""
+    t0 = pd.to_datetime(int(row.bar_t), unit="ms")
+    d = df[df["t"] > t0].reset_index(drop=True)
+    if d.empty:
+        return None
+    long = row.direction == "Long"
+    tps = [row.tp1, row.tp2, row.tp3]
+    rr = [float(x) for x in str(row.rr).split(",")][:3]
+    risk = abs(row.entry - row.sl)
+    if len(rr) < 3 or not risk > 0:
+        return None
+    sign = 1 if long else -1
+    timeout = int(row.timeout)
+    hi, lo = d["high"].values, d["low"].values
+    n = min(len(d), timeout)
+    hit, state, bars = 0, None, n
+    for i in range(n):
+        if (long and lo[i] <= row.sl) or ((not long) and hi[i] >= row.sl):
+            state, bars = "SL", i + 1
+            break
+        while hit < 3 and ((long and hi[i] >= tps[hit]) or ((not long) and lo[i] <= tps[hit])):
+            hit += 1
+        if hit == 3:
+            state, bars = "TP3", i + 1
+            break
+    if state is None:
+        if len(d) < timeout:
+            return None                                   # still running
+        state = "TIMEOUT"
+    last = float(d["close"].iloc[n - 1])
+    mtm = max(-1.0, sign * (last - row.entry) / risk)
+    rest = {"SL": -1.0, "TIMEOUT": mtm, "TP3": 0.0}[state]
+    r = sum(rr[:hit]) / 3 + (3 - hit) * rest / 3
+    label = state if not (state == "SL" and hit > 0) else f"TP{hit}→SL"
+    return label, float(r), int(bars)
+
+def journal_resolve(max_n=60):
+    """Update OPEN signals from fresh candles. Returns the number of signals closed."""
+    jdf = journal_load()
+    if jdf.empty:
+        return 0
+    op = jdf[jdf["outcome"] == "OPEN"]
+    if op.empty:
+        return 0
+    cache, closed = {}, 0
+    for row in op.head(max_n).itertuples():
+        key = (row.src, row.symbol, row.tf)
+        if key not in cache:
+            df = get_candles(row.src, row.symbol, row.tf)
+            if df is None and row.market == "crypto":
+                for alt in ("okx", "bybit", "binance"):
+                    if alt != row.src:
+                        df = get_candles(alt, row.symbol, row.tf)
+                        if df is not None:
+                            break
+            cache[key] = df
+        df = cache[key]
+        if df is None:
+            continue
+        try:
+            res = resolve_signal(row, df)
+        except Exception:
+            res = None
+        if not res:
+            continue
+        label, r, bars = res
+        with _DB_LOCK:
+            con = _db()
+            try:
+                con.execute("UPDATE signals SET outcome=?, r_result=?, closed_ts=?, bars=? WHERE id=?",
+                            (label, r, time.time(), bars, int(row.id)))
+                con.commit()
+            finally:
+                con.close()
+        closed += 1
+    return closed
+
+def wilson(w, n, z=1.96):
+    if n == 0:
+        return 0.0, 0.0
+    p = w / n
+    d = 1 + z * z / n
+    c = (p + z * z / (2 * n)) / d
+    h = z * np.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / d
+    return max(0.0, c - h), min(1.0, c + h)
+
+def _parts(s):
+    try:
+        return json.loads(s) if s else {}
+    except Exception:
+        return {}
+
+def _stat_row(g):
+    n = len(g)
+    w = int((g["net"] > 0).sum())
+    lo, hi = wilson(w, n)
+    return pd.Series({"n": n, "Win %": round(100 * w / n, 1) if n else np.nan,
+                      "95% CI": f"{lo * 100:.0f}–{hi * 100:.0f}%",
+                      "Avg R (net)": round(g["net"].mean(), 3) if n else np.nan,
+                      "Total R": round(g["net"].sum(), 2)})
+
+def render_journal():
+    st.subheader("📒 Signal journal")
+    st.caption("Every MATCH is logged once (not again while it is open or within the cooldown). Outcomes are checked "
+               "on later candles: SL is tested before TPs on the same bar, 1/3 exits at each TP, leftovers are "
+               "marked at the time stop. Signals are only logged while this app is running a scan.")
+    jdf = journal_load()
+    c1, c2, c3 = st.columns([1, 1, 2])
+    if c1.button("🔄 Update outcomes now"):
+        n = journal_resolve()
+        st.success(f"{n} signal(s) closed.")
+        jdf = journal_load()
+    cost_bps = c2.number_input("Assumed round-trip cost (bps)", 0.0, 200.0, 15.0, 1.0, key="jcost")
+    with c3.expander("Backup / restore (the DB file is lost on some hosts, e.g. Streamlit Cloud restarts)"):
+        up = st.file_uploader("Restore from exported CSV", type="csv", key="jup")
+        if up is not None and st.button("Import CSV"):
+            try:
+                st.success(f"Imported {journal_import(pd.read_csv(up))} new row(s).")
+                jdf = journal_load()
+            except Exception as e:
+                st.error(f"Import failed: {e}")
+        if st.checkbox("I understand: delete the whole journal", key="jdel_ok") and st.button("🗑️ Clear journal"):
+            journal_clear()
+            jdf = journal_load()
+
+    if jdf.empty:
+        st.info("No signals logged yet. Turn on 'Log MATCH signals' in the sidebar and keep scanning "
+                "(auto-refresh helps). Outcomes need time: expect to wait for 100+ closed signals before trusting any table below.")
+        return
+    jdf = jdf.copy()
+    jdf["risk"] = (jdf["entry"] - jdf["sl"]).abs()
+    jdf["net"] = jdf["r_result"] - cost_bps / 1e4 * jdf["entry"] / jdf["risk"].replace(0, np.nan)
+    closed = jdf[jdf["outcome"] != "OPEN"].dropna(subset=["net"])
+
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Logged", len(jdf))
+    m2.metric("Open", int((jdf["outcome"] == "OPEN").sum()))
+    m3.metric("Closed", len(closed))
+    if len(closed):
+        m4.metric("Win rate", f"{(closed['net'] > 0).mean() * 100:.0f}%")
+        m5.metric("Expectancy (R, net)", f"{closed['net'].mean():+.2f}R")
+    else:
+        m4.metric("Win rate", "n/a")
+        m5.metric("Expectancy (R, net)", "n/a")
+
+    if len(closed) < 30:
+        st.warning(f"Only {len(closed)} closed signals. Below ~30 per group the tables are mostly noise: "
+                   "use them to check the machinery works, not to change your weights.")
+    if len(closed):
+        st.markdown("**Grade vs. outcome** (does a higher grade really win more?)")
+        gt = closed.groupby("grade").apply(_stat_row).reindex(["A", "B", "C", "D"]).dropna(how="all")
+        st.dataframe(gt, width="content")
+        cc1, cc2 = st.columns(2)
+        with cc1:
+            st.markdown("**By direction**")
+            st.dataframe(closed.groupby("direction").apply(_stat_row), width="content")
+        with cc2:
+            st.markdown("**By market**")
+            st.dataframe(closed.groupby("market").apply(_stat_row), width="content")
+
+        P = pd.DataFrame([_parts(s) for s in closed["parts"]], index=closed.index)
+        comp = []
+        for col in P.columns:
+            v = P[col]
+            pos, neg = closed[v > 0], closed[v < 0]
+            a_p = pos["net"].mean() if len(pos) else np.nan
+            a_n = neg["net"].mean() if len(neg) else np.nan
+            comp.append({"Component": col, "n (+)": len(pos), "Avg R when +": round(a_p, 3) if len(pos) else np.nan,
+                         "n (−)": len(neg), "Avg R when −": round(a_n, 3) if len(neg) else np.nan,
+                         "Edge (+ minus −)": round(a_p - a_n, 3) if len(pos) and len(neg) else np.nan})
+        if comp:
+            st.markdown("**Which components carry weight?** (positive edge = the component helped; "
+                        "needs 30+ in both columns to mean anything)")
+            st.dataframe(pd.DataFrame(comp).sort_values("Edge (+ minus −)", ascending=False, na_position="last"),
+                         width="content", hide_index=True)
+
+        eq = closed.sort_values("closed_ts")["net"].cumsum().reset_index(drop=True)
+        st.markdown("**Cumulative R (net of costs)**")
+        st.line_chart(eq)
+
+    show = jdf.drop(columns=["parts", "extras", "risk"]).copy()
+    show["ts"] = pd.to_datetime(show["ts"], unit="s")
+    show["closed_ts"] = pd.to_datetime(show["closed_ts"], unit="s")
+    show["bar_t"] = pd.to_datetime(show["bar_t"], unit="ms")
+    st.markdown("**All signals**")
+    st.dataframe(show, width="content", hide_index=True)
+    st.download_button("⬇️ Export journal CSV", jdf.drop(columns=["risk", "net"]).to_csv(index=False),
+                       "signal_journal.csv", key="jdl")
+
 # ── Enrichment for MATCH/WATCH rows ─────────────────────────────
 @st.cache_data(ttl=300, show_spinner=False)
-def enrich_rows(market, src, syms, tf, n_break, vol_mult, live, oi_lb, fh_key):
+def enrich_rows(market, src, syms, tf, n_break, vol_mult, live, oi_lb, fh_key, long_bias, j_atr, j_rr):
     stocks = market == "stocks"
+    store = _store()
+    bench = get_closes(store, src, "SPY" if stocks else "BTCUSDT", "1d")
+    lb1, lb4 = (5, 20) if stocks else (7, 28)
+    scale = 8.0 if stocks else 15.0                 # % outperformance that counts as "full" relative strength
 
     def one(s):
         out = {"Breakout": "n/a", "Crash": None}
@@ -1098,6 +1632,7 @@ def enrich_rows(market, src, syms, tf, n_break, vol_mult, live, oi_lb, fh_key):
             fl = volume_flow(cdf, live)
             out["Flow"] = flow_text(fl)
             out["_dz"] = fl[2] if fl else None
+            out["_plan"] = journal_plan(cdf, long_bias, live, j_atr, j_rr)
             if not stocks:
                 out["OI"] = oi_signal(s, tf, cdf, oi_lb, live)
                 try:
@@ -1107,12 +1642,32 @@ def enrich_rows(market, src, syms, tf, n_break, vol_mult, live, oi_lb, fh_key):
                     out["_imb"] = lv_["imbalance_w"] if lv_ else None
                 except Exception:
                     out["Book"] = "n/a"
+                try:
+                    out.update(positioning(s, tf))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:                                         # relative strength vs BTC / SPY on daily closes
+            cl = get_closes(store, src, s, "1d")
+            r1 = rel_strength(cl, bench, lb1, live)
+            r4 = rel_strength(cl, bench, lb4, live)
+            out["RS 1w %"] = None if r1 is None else round(r1, 2)
+            out["RS 4w %"] = None if r4 is None else round(r4, 2)
+            if r4 is not None:
+                r1v = r1 if r1 is not None else r4 * 0.5
+                out["_rs"] = _clip(0.6 * r4 / scale + 0.4 * r1v / (scale / 2))
         except Exception:
             pass
         return s, out
 
     with ThreadPoolExecutor(max_workers=8 if stocks else 16) as ex:
         res = dict(ex.map(one, syms))
+    if stocks:
+        cal = earnings_calendar(fh_key) if fh_key else None
+        for s in syms:
+            label, days = earn_info(cal, s)
+            res[s]["Earnings"], res[s]["_ed"] = label, days
     if stocks and fh_key:
         for i, s in enumerate(syms):
             if i >= ANALYST_MAX:
@@ -1163,7 +1718,7 @@ refresh = st.sidebar.slider("Auto-refresh (minutes, 0 = off)", 0, 30, 0)
 alerts = st.sidebar.toggle("Telegram alerts (needs secrets)", False)
 
 st.sidebar.subheader("Extra signals")
-extras_on = st.sidebar.toggle("Breakout · crash risk · flow · OI · book · analyst (MATCH/WATCH rows)", True,
+extras_on = st.sidebar.toggle("Breakout · crash · flow · OI · book · funding · RS · earnings (MATCH/WATCH rows)", True,
                               help="Computed only for MATCH/WATCH rows, so the extra API cost is small.")
 sig_tf = st.sidebar.selectbox("Signal timeframe", TFS, index=3)
 n_break = st.sidebar.slider("Breakout lookback (bars)", 10, 100, 20)
@@ -1172,17 +1727,40 @@ oi_lb = st.sidebar.slider("OI / price change lookback (bars)", 2, 30, 5)
 crash_max = st.sidebar.slider("Crash protector: hide MATCH/WATCH with risk ≥ (100 = off)", 10, 100, 100, 5,
                               help="Meant for long setups. Leave at 100 when scanning for shorts.")
 req_break = st.sidebar.toggle("Only breakouts", False)
+hide_crowd = st.sidebar.toggle("Hide setups crowded in my direction", False,
+                               help="Longs: funding / long-share very high. Shorts: very negative (crypto only).")
 req_oi = False
 min_analyst = "Any"
+hide_earn = 0
 fh_key = ""
 if is_stocks:
     min_analyst = st.sidebar.selectbox("Min analyst rating", ["Any"] + list(ANALYST_MIN))
+    hide_earn = st.sidebar.slider("Hide stocks with earnings within (days, 0 = off)", 0, 14, 0)
     try:
         fh_key = st.secrets["FINNHUB_KEY"]
     except Exception:
-        fh_key = st.sidebar.text_input("Finnhub API key (free) for analyst ratings", type="password")
+        fh_key = st.sidebar.text_input("Finnhub API key (free): analyst ratings + earnings dates", type="password")
 else:
     req_oi = st.sidebar.toggle("Only OI rising with price up", False)
+
+st.sidebar.subheader("Macro events (UTC)")
+macro_txt = st.sidebar.text_area("One per line: YYYY-MM-DD HH:MM label", DEFAULT_MACRO, height=110,
+                                 help="FOMC dates are prefilled. Add CPI, NFP, token unlocks, ETF decisions... "
+                                      "Events within 24h lower the conviction score.")
+
+st.sidebar.subheader("Signal journal")
+j_on = st.sidebar.toggle("Log MATCH signals to journal", True,
+                         help="Needs 'extra signals' on. Stored in a local SQLite file (JOURNAL_DB env var to change).")
+j_atr = st.sidebar.number_input("Journal SL (ATR multiple)", 0.5, 10.0, 1.5, 0.25)
+j_rr_txt = st.sidebar.text_input("Journal TPs in R", "1,2,3")
+j_timeout = st.sidebar.slider("Time stop (bars of signal TF)", 5, 200, 30, 5)
+j_cool = st.sidebar.slider("Don't re-log same symbol within (hours)", 1, 168, 24)
+try:
+    j_rr = tuple(float(x) for x in j_rr_txt.split(","))[:3]
+    assert len(j_rr) == 3 and all(x > 0 for x in j_rr)
+except Exception:
+    j_rr = (1.0, 2.0, 3.0)
+    st.sidebar.warning("Journal TPs must be three positive numbers: using 1,2,3")
 
 st.sidebar.subheader("EMA criteria presets")
 preset_name = st.sidebar.selectbox(
@@ -1215,7 +1793,7 @@ if refresh:
 
 # ── Main ────────────────────────────────────────────────────────
 st.markdown('<div class="hero"><h2>📈 MTF EMA Screener Pro</h2>'
-            '<span>Multi-timeframe EMA scan · crypto + US stocks · trade planner · Monte Carlo</span></div>',
+            '<span>Multi-timeframe EMA scan · crypto + US stocks · positioning · events · journal · trade planner</span></div>',
             unsafe_allow_html=True)
 if st.button("🔄 Scan now"):
     run_scan.clear()
@@ -1255,33 +1833,47 @@ df = df[_lead + [c for c in df.columns if c not in _lead]]          # stable col
 match = df[df["Status"] == "MATCH"]
 watch = df[df["Status"] == "WATCH"]
 
+# ── Macro context ───────────────────────────────────────────────
+macro_events = parse_macro(macro_txt)
+macro_next = next_macro(macro_events)
+macro_h = macro_next[0] if macro_next else None
+long_bias = rules_direction(rules)
+
 # ── Extra signals (MATCH/WATCH rows only) + filters ─────────────
-extra, as_map, regime, hidden = {}, {}, None, 0
+extra, as_map, regime, hidden, conv_map, n_logged = {}, {}, None, 0, {}, 0
 if extras_on:
     pool_syms = (list(match["Symbol"]) + list(watch["Symbol"]))[:ENRICH_MAX]
     if pool_syms:
         with st.spinner("Computing extra signals..."):
             try:
                 extra = enrich_rows(market, data_src, tuple(pool_syms), sig_tf, n_break, vol_mult,
-                                    live, oi_lb, fh_key)
+                                    live, oi_lb, fh_key, long_bias, float(j_atr), j_rr)
             except Exception as e:
                 st.warning(f"Extra signals failed: {e}")
     try:
         regime = market_regime(market, data_src)
     except Exception:
         regime = None
-    for col in ("Breakout", "Crash", "Flow", "OI", "Book", "Analyst"):
+    for col in ("Breakout", "Crash", "Flow", "OI", "Book", "Funding", "L/S", "Crowding",
+                "RS 1w %", "RS 4w %", "Earnings", "Analyst"):
         if any(col in v for v in extra.values()):
             df[col] = df["Symbol"].map(lambda s, c=col: extra.get(s, {}).get(c))
-    if "Crash" in df.columns:
-        df["Crash"] = pd.to_numeric(df["Crash"], errors="coerce")
+    for col in ("Crash", "RS 1w %", "RS 4w %"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
     if extra:
-        long_bias = rules_direction(rules)
         st_map = dict(zip(df["Symbol"], df["Status"]))
-        df["Conviction"] = df["Symbol"].map(
-    lambda s: conviction(extra[s], long_bias, st_map.get(s), regime)[0] if s in extra else None)
+        for s, ex in extra.items():
+            conv_map[s] = conviction(ex, long_bias, st_map.get(s), regime, macro_h)
+        df["Conviction"] = df["Symbol"].map(lambda s: conv_map[s][0] if s in conv_map else None)
 
     as_map = {s: v.get("_as") for s, v in extra.items()}
+    ed_map = {s: v.get("_ed") for s, v in extra.items()}
+    crowd_map = {s: v.get("_crowd") for s, v in extra.items()}
+
+    def _crowded(s):
+        c = crowd_map.get(s)
+        return c is not None and ((long_bias and c >= 0.5) or ((not long_bias) and c <= -0.5))
 
     def keep(frame):
         f = frame
@@ -1293,6 +1885,10 @@ if extras_on:
             f = f[f["OI"].astype(str).str.startswith("🟢")]
         if min_analyst != "Any" and any(v is not None for v in as_map.values()):
             f = f[pd.to_numeric(f["Symbol"].map(as_map), errors="coerce") >= ANALYST_MIN[min_analyst]]
+        if hide_earn and any(v is not None for v in ed_map.values()):
+            f = f[~f["Symbol"].map(lambda s: ed_map.get(s) is not None and ed_map[s] <= hide_earn).astype(bool)]
+        if hide_crowd:
+            f = f[~f["Symbol"].map(_crowded).astype(bool)]
         return f
 
     match = df[df["Status"] == "MATCH"]
@@ -1304,6 +1900,32 @@ if extras_on:
         match = match.sort_values("Conviction", ascending=False, na_position="last")
         watch = watch.sort_values("Conviction", ascending=False, na_position="last")
 
+    # ── Journal: log every displayed MATCH once, then resolve old signals (throttled) ──
+    if j_on and not match.empty:
+        for s in match["Symbol"]:
+            ex = extra.get(s) or {}
+            pl, cv_ = ex.get("_plan"), conv_map.get(s)
+            if not pl or not cv_:
+                continue
+            rec = {"ts": time.time(), "market": market, "src": data_src, "symbol": s, "tf": sig_tf,
+                   "direction": "Long" if long_bias else "Short", "bar_t": pl["bar_t"],
+                   "entry": pl["entry"], "sl": pl["sl"], "tp1": pl["tps"][0], "tp2": pl["tps"][1],
+                   "tp3": pl["tps"][2], "rr": ",".join(f"{x:g}" for x in pl["rr"]), "timeout": int(j_timeout),
+                   "conviction": cv_[0], "grade": grade(cv_[0]), "status": "MATCH",
+                   "parts": json.dumps({k: round(float(v), 2) for k, v in cv_[1].items()}),
+                   "extras": extras_json(ex, regime)}
+            n_logged += bool(journal_insert(rec, j_cool))
+
+if j_on:
+    with _CACHE_LOCK:
+        _last = _SHARED.get(("__jr_last__",), (0, None))[0]
+    if time.time() - _last > 300:
+        with _CACHE_LOCK:
+            _SHARED[("__jr_last__",)] = (time.time(), True)
+        try:
+            journal_resolve()
+        except Exception:
+            pass
 
 m1, m2, m3, m4, m5 = st.columns(5)
 m1.metric("Scanned", len(df))
@@ -1317,8 +1939,26 @@ if regime:
     rc = "n/a" if regime["crash"] is None else f"{regime['crash']}/100"
     st.markdown(f"{icon} **Market regime: {regime['state']}** · {regime['sym']} 1D is "
                 f"{regime['d200']:+.1f}% vs EMA200 · benchmark crash score {rc}")
+if macro_next:
+    hh = macro_next[0]
+    st.warning(f"📅 **Macro event: {macro_next[1]}** " +
+               ("is happening now / just released" if hh < 0.05 else f"in {hh:.1f}h") +
+               ". Conviction scores are reduced; consider smaller size or waiting for the move to settle.")
+if extras_on and is_stocks:
+    try:
+        ms = macro_snapshot()
+    except Exception:
+        ms = {}
+    if ms:
+        cols = st.columns(len(ms))
+        for col, (name, (val, chg)) in zip(cols, ms.items()):
+            col.metric(name, f"{val:,.2f}", f"{chg:+.2f}%", delta_color="off")
+if is_stocks and extras_on and not fh_key:
+    st.caption("ℹ️ Add a free Finnhub key in the sidebar to see earnings dates (gap risk) and analyst ratings.")
 if hidden:
     st.caption(f"{hidden} MATCH/WATCH rows hidden by the extra-signal filters (still visible in the All tab).")
+if n_logged:
+    st.caption(f"📒 {n_logged} new MATCH signal(s) logged to the journal.")
 
 now = set(match["Symbol"])
 pkey = f"prev_matches_{market}"          # separate state per market -> no false alerts on switch
@@ -1337,7 +1977,7 @@ if "Crash" in df.columns:
 if "Conviction" in df.columns:
     cfg["Conviction"] = st.column_config.ProgressColumn("Conviction", min_value=0, max_value=100, format="%d")
 
-t1, t2, t3, t4 = st.tabs(["✅ MATCH", "👀 WATCH", "All", "🎯 Trade planner"])
+t1, t2, t3, t4, t5 = st.tabs(["✅ MATCH", "👀 WATCH", "All", "🎯 Trade planner", "📒 Journal"])
 for key, tab, data in (("match", t1, match), ("watch", t2, watch), ("all", t3, df)):
     with tab:
         if data.empty:
@@ -1421,8 +2061,9 @@ with t4:
                 cs = crash_score(cdf, live)
                 ex_live = {"Breakout": bo, "Crash": cs[0] if cs else None, "OI": exs.get("OI"),
                            "_dz": fl[2] if fl else None, "_imb": lv["imbalance_w"] if lv else None,
-                           "_as": exs.get("_as")}
-                cv, parts = conviction(ex_live, long, "MATCH" if sym in now else "WATCH", regime)
+                           "_as": exs.get("_as"), "_crowd": exs.get("_crowd"), "_rs": exs.get("_rs"),
+                           "_ed": exs.get("_ed")}
+                cv, parts = conviction(ex_live, long, "MATCH" if sym in now else "WATCH", regime, macro_h)
                 blocked = blocked_tps(lv, entry, tps, long)
                 qty = (equity * risk_pct / 100) / risk
                 if is_stocks:
@@ -1450,7 +2091,8 @@ with t4:
                                 unsafe_allow_html=True)
                     st.metric("P(SL before any TP)", f"{mc['p_sl']*100:.0f}%")
                     st.metric("Expected value (R)", f"{mc['ev_r']:+.2f}R",
-                              help="1/3 of the position exits at each TP; leftovers marked at horizon end.")
+                              help="1/3 of the position exits at each TP; leftovers marked at horizon end. "
+                                   "Bootstrap of past returns: mostly reflects your R multiples and costs, not an edge.")
                     st.metric("Net EV after costs", f"{ev_net:+.2f}R", f"costs {cost_r:.2f}R", delta_color="off")
                     st.metric("Setup grade", f"{grade(cv)} · {cv}/100",
                               help=" · ".join(f"{k} {v:+.0f}" for k, v in parts.items()))
@@ -1480,8 +2122,64 @@ with t4:
                               help=cs[1] if cs else None)
                     if exs.get("OI"):
                         st.metric(f"Open interest ({sig_tf})", exs["OI"])
+                    if exs.get("Crowding") and exs["Crowding"] != "n/a":
+                        st.metric("Positioning", exs["Crowding"])
+                        st.caption(f"Funding: {exs.get('Funding', 'n/a')}  \nLong/short: {exs.get('L/S', 'n/a')}")
+                    if exs.get("RS 4w %") is not None:
+                        bm = "SPY" if is_stocks else "BTC"
+                        st.metric(f"Relative strength vs {bm}",
+                                  f"{exs.get('RS 4w %'):+.1f}% (4w)",
+                                  f"{exs.get('RS 1w %'):+.1f}% (1w)" if exs.get("RS 1w %") is not None else None,
+                                  delta_color="off")
+                    if exs.get("Earnings") and exs["Earnings"] not in ("-",):
+                        st.metric("Earnings", exs["Earnings"])
                     if exs.get("Analyst"):
                         st.metric("Analyst rating", exs["Analyst"])
+
+                # "What is driving this score": every component with its points
+                with st.expander("🧭 Why this grade? (drivers, risks, catalysts)", expanded=True):
+                    drv = pd.DataFrame([{"Component": k, "Points": round(v, 1), "Meaning": DRIVER_HELP.get(k, "")}
+                                        for k, v in sorted(parts.items(), key=lambda kv: -abs(kv[1])) if v != 0])
+                    if not drv.empty:
+                        st.dataframe(drv, hide_index=True, width="content")
+                    warn = []
+                    if macro_next:
+                        warn.append(f"Macro event **{macro_next[1]}** in {macro_next[0]:.1f}h")
+                    ed_ = exs.get("_ed")
+                    if ed_ is not None and ed_ <= 7:
+                        warn.append(f"Earnings in {ed_} day(s): a gap can jump straight over your stop")
+                    cr_ = exs.get("_crowd")
+                    if cr_ is not None and ((long and cr_ >= 0.5) or ((not long) and cr_ <= -0.5)):
+                        warn.append("Positioning is crowded in your direction: late-trade / squeeze risk")
+                    if blocked:
+                        warn.append(f"TP{blocked[0][0]}+ sits behind an opposing wall")
+                    if regime and ((long and regime["state"] == "RISK-OFF") or ((not long) and regime["state"] == "RISK-ON")):
+                        warn.append(f"Trade goes against the market regime ({regime['state']})")
+                    for w_ in warn:
+                        st.warning(w_)
+                    if not warn:
+                        st.success("No event, crowding or regime warning right now.")
+
+                # one-click journal entry for the exact plan shown above
+                if entry_mode == "Market":
+                    if st.button("📝 Log this plan to journal", key="logplan"):
+                        rec = {"ts": time.time(), "market": market, "src": data_src, "symbol": sym, "tf": ctf,
+                               "direction": direction, "bar_t": int(pd.Timestamp(cdf["t"].iloc[-1]).timestamp() * 1000),
+                               "entry": float(entry), "sl": float(sl), "tp1": float(tps[0]), "tp2": float(tps[1]),
+                               "tp3": float(tps[2]), "rr": ",".join(f"{x:g}" for x in rr),
+                               "timeout": int(j_timeout), "conviction": cv, "grade": grade(cv),
+                               "status": "MATCH" if sym in now else "WATCH",
+                               "parts": json.dumps({k: round(float(v), 2) for k, v in parts.items()}),
+                               "extras": extras_json(exs, regime)}
+                        if journal_insert(rec, 0):
+                            st.success("Logged. Outcome is tracked automatically (time stop = "
+                                       f"{j_timeout} bars of {ctf}).")
+                        else:
+                            st.warning("Not logged: this symbol/direction is already open in the journal "
+                                       "(or the journal file is not writable).")
+                else:
+                    st.caption("Journal logging is for market entries only (a limit order may never fill).")
+
                 st.caption("Monte Carlo = bootstrap of the last ≤500 log-returns on the chosen timeframe; "
                            "hits are checked on closes. A statistical estimate, not a prediction or financial advice.")
                 if is_stocks:
@@ -1500,3 +2198,7 @@ with t4:
                             st.info("No recent trade data available for this symbol.")
             except Exception as e:
                 st.error(f"Trade planner error: {e}")
+
+# ── Journal ─────────────────────────────────────────────────────
+with t5:
+    render_journal()

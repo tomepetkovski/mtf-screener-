@@ -758,7 +758,6 @@ def get_orderbook(src, sym):
 
 def _usd(x):
     return f"${x / 1e6:.1f}M" if x >= 1e6 else f"${x / 1e3:.0f}k"
-
 def orderbook_levels(src, sym, price, atr_abs=0.0, band=0.03, bins=40, z=3.0):
     """Bucket resting orders (USD notional) around price and flag buckets that are
     statistical outliers (robust z >= z) as walls. Also returns book imbalance (over the range
@@ -767,9 +766,11 @@ def orderbook_levels(src, sym, price, atr_abs=0.0, band=0.03, bins=40, z=3.0):
     if not ob or not ob[0] or not ob[1]:
         return None
     bids, asks = ob
+    min_bid = min(p for p, _ in bids)
+    max_ask = max(p for p, _ in asks)
     # depth snapshots only cover a limited range on liquid coins: never bucket beyond what we have
-    lo = max(price * (1 - band), min(p for p, _ in bids))
-    hi = min(price * (1 + band), max(p for p, _ in asks))
+    lo = max(price * (1 - band), min_bid)
+    hi = min(price * (1 + band), max_ask)
     if hi <= lo:
         return None
     edges = np.linspace(lo, hi, bins + 1)
@@ -783,12 +784,13 @@ def orderbook_levels(src, sym, price, atr_abs=0.0, band=0.03, bins=40, z=3.0):
         return np.bincount(idx, weights=arr[:, 1], minlength=bins)
 
     b, a = bucket(bids), bucket(asks)
-    allv = np.concatenate([b, a])
-    nz = allv[allv > 0]
+    nz = np.concatenate([b, a])
+    nz = nz[nz > 0]
     if len(nz) < 8:
         return None
     med = float(np.median(nz))
     mad = float(np.median(np.abs(nz - med)) * 1.4826) or float(nz.std()) or 1.0
+    mad = max(mad, 0.05 * med)          # floor: a very uniform book must not turn noise into "walls"
 
     def walls(arr):
         out, used = [], []
@@ -796,37 +798,60 @@ def orderbook_levels(src, sym, price, atr_abs=0.0, band=0.03, bins=40, z=3.0):
             zs = (arr[i] - med) / mad
             if zs < z or len(out) >= 3:
                 break
-            if any(abs(i - j) <= 1 for j in used):          # merge neighbouring buckets
+            if any(abs(i - j) <= 1 for j in used):          # skip neighbours of an accepted wall
                 continue
             used.append(i)
-            out.append({"price": float(mid[i]), "lo": float(edges[i]), "hi": float(edges[i + 1]),
-                        "usd": float(arr[i]), "z": float(zs)})
+            # absorb adjacent buckets that are themselves elevated, so a wall split across
+            # a bucket edge is reported with its full size
+            i0 = i - 1 if i > 0 and (arr[i - 1] - med) / mad >= z / 2 else i
+            i1 = i + 1 if i < bins - 1 and (arr[i + 1] - med) / mad >= z / 2 else i
+            usd = float(arr[i0:i1 + 1].sum())
+            ctr = float(np.average(mid[i0:i1 + 1], weights=arr[i0:i1 + 1]))
+            out.append({"price": ctr, "lo": float(edges[i0]), "hi": float(edges[i1 + 1]),
+                        "usd": usd, "z": float(zs),
+                        "dist_pct": (ctr / price - 1) * 100})
         return out
 
     bw, aw = walls(b), walls(a)
     # imbalance over the range BOTH sides actually cover (max 1%), so the sides are comparable
-    cov = min(0.01, (price - min(p for p, _ in bids)) / price, (max(p for p, _ in asks) - price) / price)
-    near = lambda lv, side: sum(p * q for p, q in lv if abs(p / price - 1) <= cov)
-    B, A = near(bids, "b"), near(asks, "a")
+    cov = min(0.01, (price - min_bid) / price, (max_ask - price) / price)
+    if cov <= 0:
+        return None
+
+    def near(lv, weighted=False):
+        tot = 0.0
+        for p, q in lv:
+            d = abs(p / price - 1)
+            if d <= cov:
+                tot += p * q * ((1 - 0.5 * d / cov) if weighted else 1.0)
+        return tot
+
+    B, A = near(bids), near(asks)
     imb = (B - A) / (B + A) if (B + A) > 0 else 0.0
+    Bw, Aw = near(bids, True), near(asks, True)          # closer orders count more (less spoof-prone)
+    imb_w = (Bw - Aw) / (Bw + Aw) if (Bw + Aw) > 0 else 0.0
+
     buf = 0.1 * atr_abs
     long_entry = short_entry = None
     below = [w for w in bw if w["hi"] <= price * 1.001]
     above = [w for w in aw if w["lo"] >= price * 0.999]
+    # prefer big walls, but penalise walls that are far away (less likely to be reached / fill)
+    score = lambda w: w["usd"] / (1 + 100 * abs(w["price"] / price - 1))
     if below:
-        w = max(below, key=lambda x: x["usd"])
+        w = max(below, key=score)
         long_entry = {"entry": min(w["hi"] + buf, price), "invalid_below": w["lo"] - buf, "wall": w}
     if above:
-        w = max(above, key=lambda x: x["usd"])
+        w = max(above, key=score)
         short_entry = {"entry": max(w["lo"] - buf, price), "invalid_above": w["hi"] + buf, "wall": w}
-    return {"bid_walls": bw, "ask_walls": aw, "imbalance": float(imb),
+    return {"bid_walls": bw, "ask_walls": aw, "imbalance": float(imb), "imbalance_w": float(imb_w),
             "long_entry": long_entry, "short_entry": short_entry}
 
 def book_label(lv, price):
     if not lv:
         return "n/a"
-    icon = "🟢" if lv["imbalance"] > 0.15 else "🔴" if lv["imbalance"] < -0.15 else "➖"
-    parts = [f"{icon} imb {lv['imbalance']:+.0%}"]
+    imb = lv["imbalance"]
+    icon = "🟢" if imb > 0.15 else "🔴" if imb < -0.15 else "➖"
+    parts = [f"{icon} imb {imb:+.0%}"]
     if lv["bid_walls"]:
         w = max(lv["bid_walls"], key=lambda x: x["usd"])
         parts.append(f"bid {_usd(w['usd'])} @ {(w['price'] / price - 1) * 100:+.1f}%")
@@ -837,6 +862,8 @@ def book_label(lv, price):
 
 def add_walls(fig, lv):
     """Draw the walls on the trade-planner chart."""
+    if not lv:
+        return fig
     for w in lv["bid_walls"]:
         fig.add_hrect(y0=w["lo"], y1=w["hi"], fillcolor="rgba(34,197,94,.22)", line_width=0,
                       annotation_text=f"BID wall {_usd(w['usd'])} (z {w['z']:.1f})",
@@ -861,7 +888,8 @@ def get_trades(src, sym):
                 d = fetch(BY, "/v5/market/recent-trade", {"category": "spot", "symbol": sym, "limit": 60})
             return [(float(t["price"]), float(t["size"]), t["side"] == "Buy") for t in d["result"]["list"]]
         if src == "okx":
-            d = fetch(OK, "/api/v5/market/trades", {"instId": sym[:-4] + "-USDT", "limit": 500})
+            base = sym[:-4] if sym.endswith("USDT") else sym
+            d = fetch(OK, "/api/v5/market/trades", {"instId": f"{base}-USDT", "limit": 500})
             return [(float(t["px"]), float(t["sz"]), t["side"] == "buy") for t in d["data"]]
     except Exception:
         pass
@@ -869,7 +897,8 @@ def get_trades(src, sym):
 
 def footprint(src, sym, bins=40, imb_ratio=3.0):
     """Buy/sell volume per price bucket from the latest trades (a mini footprint).
-    Returns (DataFrame[price, buy, sell, delta, total, imbalance], poc_price, cvd) or None."""
+    Returns (DataFrame[price, buy, sell, delta, total, imbalance], poc_price, cvd) or None.
+    Extra info is stored in fp.attrs: vah, val (70% value area), delta_z (CVD vs trade-size noise)."""
     tr = get_trades(src, sym)
     if not tr or len(tr) < 50:
         return None
@@ -884,9 +913,31 @@ def footprint(src, sym, bins=40, imb_ratio=3.0):
     sell = np.bincount(idx, weights=q * ~isb, minlength=bins)
     fp = pd.DataFrame({"price": (edges[:-1] + edges[1:]) / 2, "buy": buy, "sell": sell})
     fp["delta"], fp["total"] = fp["buy"] - fp["sell"], fp["buy"] + fp["sell"]
-    fp["imbalance"] = np.where(fp["buy"] >= imb_ratio * fp["sell"].clip(lower=1e-12), "BUY",
-                      np.where(fp["sell"] >= imb_ratio * fp["buy"].clip(lower=1e-12), "SELL", ""))
-    return fp, float(fp.loc[fp["total"].idxmax(), "price"]), float(fp["delta"].sum())
+
+    # imbalance only counts on buckets with meaningful volume (avoids "BUY" on 0.0001 vs 0)
+    active = fp["total"] >= np.median(fp["total"][fp["total"] > 0])
+    buy_dom = fp["buy"] >= imb_ratio * fp["sell"].clip(lower=1e-12)
+    sell_dom = fp["sell"] >= imb_ratio * fp["buy"].clip(lower=1e-12)
+    fp["imbalance"] = np.where(active & buy_dom, "BUY", np.where(active & sell_dom, "SELL", ""))
+
+    poc_i = int(fp["total"].idxmax())
+    # value area: expand from the POC until 70% of the volume is covered
+    tot, target = float(fp["total"].sum()), 0.70 * float(fp["total"].sum())
+    l = r = poc_i
+    acc = float(fp["total"].iloc[poc_i])
+    while acc < target and (l > 0 or r < bins - 1):
+        up = fp["total"].iloc[r + 1] if r < bins - 1 else -1
+        dn = fp["total"].iloc[l - 1] if l > 0 else -1
+        if up >= dn:
+            r += 1; acc += up
+        else:
+            l -= 1; acc += dn
+    # z-score of net signed flow: how far CVD is from what random buy/sell would give
+    signed = np.where(isb, q, -q)
+    sd = float(signed.std() * np.sqrt(len(signed))) or 1.0
+    fp.attrs.update(vah=float(fp["price"].iloc[r]), val=float(fp["price"].iloc[l]),
+                    delta_z=float(signed.sum() / sd))
+    return fp, float(fp["price"].iloc[poc_i]), float(fp["delta"].sum())
 
 def footprint_chart(fp, poc, entry=None):
     fig = go.Figure()
@@ -896,10 +947,18 @@ def footprint_chart(fp, poc, entry=None):
     fig.add_trace(go.Bar(y=fp["price"], x=-fp["sell"], orientation="h", name="Aggressive sell",
                          marker_color="#ef4444", width=h))
     fig.add_hline(y=poc, line_dash="dot", line_color="#f59e0b", annotation_text="POC")
+    attrs = getattr(fp, "attrs", {}) or {}
+    for k, name in (("vah", "VAH"), ("val", "VAL")):
+        if k in attrs:
+            fig.add_hline(y=attrs[k], line_dash="dash", line_width=1, line_color="#94a3b8",
+                          annotation_text=name, annotation_position="top right")
     if entry:
         fig.add_hline(y=entry, line_color="#3b82f6", annotation_text="ENTRY")
+    title = "Volume at price (buy right / sell left)"
+    if "delta_z" in attrs:
+        title += f" · flow z {attrs['delta_z']:+.1f}"
     fig.update_layout(barmode="relative", template="plotly_dark", height=420,
-                      margin=dict(l=10, r=10, t=30, b=10), title="Volume at price (buy right / sell left)")
+                      margin=dict(l=10, r=10, t=30, b=10), title=title)
     return fig
 
 # ── Stocks: no free order book -> high-volume nodes as proxy support/resistance ──

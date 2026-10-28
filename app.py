@@ -670,7 +670,7 @@ def analyst_rating(sym, key):
         d = fetch(FH, "/api/v1/stock/recommendation", {"symbol": sym.replace("-", "."), "token": key})
     if not isinstance(d, list):
         return "n/a", None                                   # error / rate limit: do not cache
-    res = _analyst_label(max(d, key=lambda r: r.get("period", ""))) if d else ("n/a", None)
+    res = _analyst_trend(d) if d else ("n/a", None)
     with _CACHE_LOCK:
         store[k] = (time.time(), res)
     return res
@@ -966,57 +966,7 @@ def _analyst_trend(d):
             label += " ▼"
     return label, sc
 
-# ════════════════════════════════════════════════════════════════
-# INTEGRATION (edit the existing code as follows)
-# ════════════════════════════════════════════════════════════════
-#
-# A) analyst_rating(): replace the line
-#        res = _analyst_label(max(d, key=lambda r: r.get("period", ""))) if d else ("n/a", None)
-#    with
-#        res = _analyst_trend(d) if d else ("n/a", None)
-#
-# B) enrich_rows() -> inside one(s), after `out["Crash"] = ...`:
-#        out["Flow"] = flow_text(volume_flow(cdf, live))
-#        if not stocks:
-#            px = float(cdf["close"].iloc[-1])
-#            out["Book"] = book_label(orderbook_levels(src, s, px, float(atr(cdf).iloc[-1])), px)
-#    (the order-book call is one extra request per MATCH/WATCH row; results are cached 5 min)
-#
-# C) In the "Extra signals" merge loop, add the new columns:
-#        for col in ("Breakout", "Crash", "OI", "Analyst", "Flow", "Book"):
-#
-# D) Trade planner, replace the `left.plotly_chart(build_chart(...))` line with:
-#        fig = build_chart(cdf, lf, ls, entry, sl, tps, mc, ctf, long)
-#        lv = None if is_stocks else orderbook_levels(data_src, sym, entry, float(atr(cdf).iloc[-1]))
-#        if lv:
-#            add_walls(fig, lv)
-#        left.plotly_chart(fig, width="stretch")
-#
-#    and inside `with right:` (after the Position size metric):
-#        if lv:
-#            st.metric("Book imbalance (±1%)", f"{lv['imbalance']:+.0%}")
-#            sug = lv["long_entry"] if long else lv["short_entry"]
-#            if sug:
-#                inv = sug.get("invalid_below") or sug.get("invalid_above")
-#                st.metric("Wall-based limit entry", fmt(sug["entry"]),
-#                          f"{_usd(sug['wall']['usd'])} wall · invalid beyond {fmt(inv)}", delta_color="off")
-#        elif is_stocks:
-#            nodes = volume_nodes(cdf)
-#            st.metric("Volume POC (support/resist.)", fmt(nodes[0][0]))
-#        fl = volume_flow(cdf, live)
-#        if fl:
-#            st.metric(f"Volume flow ({ctf})", fl[0], f"vz {fl[1]:+.1f} · dz {fl[2]:+.1f}", delta_color="off")
-#
-# E) Footprint, after the final st.caption(...) lines inside the try-block:
-#        if not is_stocks:
-#            with st.expander("🦶 Footprint: volume at price (last ~1000 trades)"):
-#                res_fp = footprint(data_src, sym)
-#                if res_fp:
-#                    fp, poc, cvd = res_fp
-#                    st.plotly_chart(footprint_chart(fp, poc, entry), width="stretch")
-#                    st.caption(f"Net aggressive delta: {cvd:+,.2f} · POC {fmt(poc)}")
-#                else:
-#                    st.info("No recent trade data available for this symbol.")
+
 
 # ── Sidebar ─────────────────────────────────────────────────────
 st.sidebar.header("⚙️ Settings")

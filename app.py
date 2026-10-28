@@ -1973,9 +1973,13 @@ st.session_state[pkey] = now
 pct_cols = {c: st.column_config.NumberColumn(c, format="%.2f%%") for c in df.columns if "%" in c}
 cfg = {"Price": st.column_config.NumberColumn("Price", format="%.6g"), **pct_cols}
 if "Crash" in df.columns:
-    cfg["Crash"] = st.column_config.ProgressColumn("Crash risk", min_value=0, max_value=100, format="%d")
+        cfg["Crash"] = st.column_config.ProgressColumn("Crash risk", min_value=0, max_value=100, format="%d")
 if "Conviction" in df.columns:
-    cfg["Conviction"] = st.column_config.ProgressColumn("Conviction", min_value=0, max_value=100, format="%d")
+        cfg["Conviction"] = st.column_config.ProgressColumn("Conviction", min_value=0, max_value=100, format="%d")
+for _c in ("Breakout", "Flow", "OI", "Book", "Funding", "L/S", "Crowding", "Earnings", "Analyst",
+               "RS 1w %", "RS 4w %"):
+        if _c in df.columns and _c not in cfg:
+            cfg[_c] = st.column_config.TextColumn(_c)
 
 t1, t2, t3, t4, t5 = st.tabs(["✅ MATCH", "👀 WATCH", "All", "🎯 Trade planner", "📒 Journal"])
 for key, tab, data in (("match", t1, match), ("watch", t2, watch), ("all", t3, df)):

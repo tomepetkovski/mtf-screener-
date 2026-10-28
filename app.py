@@ -1,5 +1,7 @@
+import threading
 import time
 from functools import partial
+from urllib.parse import quote
 
 import numpy as np
 import pandas as pd
@@ -76,21 +78,34 @@ PRESETS = {
 }
 TF_MINUTES = {"15m": 15, "1h": 60, "4h": 240, "1d": 1440, "1w": 10080}
 
+MARKETS = {"Crypto (USDT spot)": "crypto", "US stocks (NASDAQ + NYSE)": "stocks"}
+STOCK_EXCH = ["NASDAQ", "NYSE"]
+STOCK_WORKERS = 12      # Yahoo rate-limits hard; raise carefully
+CRYPTO_WORKERS = 32
+CLOSES_KEPT = 700       # enough warm-up for EMA200, keeps the cache small
+ENRICH_MAX = 150        # extra signals are computed for at most this many MATCH/WATCH rows
+ANALYST_MAX = 100       # Finnhub free tier = 60 calls/min; results are cached for 24h
+ANALYST_MIN = {"Hold+": -0.4, "Buy+": 0.4, "Strong Buy": 1.2}
+
 # ── HTTP ────────────────────────────────────────────────────────
-def fetch(bases, path, params=None, retries=2):
+def fetch(bases, path, params=None, retries=2, headers=None):
+    hdr = headers or {"User-Agent": "Mozilla/5.0"}
     for _ in range(retries):
         for b in bases:
             try:
-                r = requests.get(b + path, params=params, timeout=15,
-                                 headers={"User-Agent": "Mozilla/5.0"})
+                r = requests.get(b + path, params=params, timeout=15, headers=hdr)
                 if r.ok:
                     return r.json()
+                if r.status_code == 404:      # unknown symbol: no point retrying
+                    return None
+                if r.status_code == 429:      # rate limited: back off
+                    time.sleep(1.5)
             except Exception:
                 pass
         time.sleep(0.4)
     return None
 
-# ── Providers ───────────────────────────────────────────────────
+# ── Crypto providers ────────────────────────────────────────────
 BN = ["https://data-api.binance.vision", "https://api.binance.com"]
 BY = ["https://api.bybit.com", "https://api.bytick.com"]
 OK = ["https://www.okx.com", "https://aws.okx.com"]
@@ -103,7 +118,7 @@ def binance_universe():
 
 def binance_ohlc(sym, tf):
     k = fetch(BN, "/api/v3/klines", {"symbol": sym, "interval": tf, "limit": 500})
-    return [[c[0], c[1], c[2], c[3], c[4]] for c in k] if isinstance(k, list) else None
+    return [[c[0], c[1], c[2], c[3], c[4], c[5]] for c in k] if isinstance(k, list) else None
 
 def bybit_universe():
     d = fetch(BY, "/v5/market/tickers", {"category": "spot"})
@@ -116,7 +131,7 @@ def bybit_ohlc(sym, tf):
     d = fetch(BY, "/v5/market/kline",
               {"category": "spot", "symbol": sym, "interval": BY_TF[tf], "limit": 500})
     try:
-        return [c[:5] for c in reversed(d["result"]["list"])]
+        return [c[:6] for c in reversed(d["result"]["list"])]
     except Exception:
         return None
 
@@ -132,39 +147,181 @@ def okx_ohlc(sym, tf):
     d = fetch(OK, "/api/v5/market/candles",
               {"instId": sym[:-4] + "-USDT", "bar": OK_TF[tf], "limit": 300})
     try:
-        return [c[:5] for c in reversed(d["data"])]
+        return [c[:6] for c in reversed(d["data"])]
     except Exception:
         return None
+
+# ── US stocks (NASDAQ + NYSE) ───────────────────────────────────
+# Universe: nasdaq.com screener API (has price + volume -> ranked by dollar volume),
+# falling back to the official NASDAQ Trader symbol directory (no volume).
+# Prices: Yahoo Finance chart API. Yahoo has no 4h bars, so 4h is built from 60m bars.
+NQ = ["https://api.nasdaq.com"]
+NQ_HDR = {"User-Agent": "Mozilla/5.0", "Accept": "application/json, text/plain, */*",
+          "Origin": "https://www.nasdaq.com", "Referer": "https://www.nasdaq.com/"}
+YH = ["https://query1.finance.yahoo.com", "https://query2.finance.yahoo.com"]
+YH_TF = {"15m": ("15m", "60d"), "1h": ("60m", "1y"), "4h": ("60m", "1y"),
+         "1d": ("1d", "5y"), "1w": ("1wk", "10y")}
+
+def _num(s):
+    try:
+        return float(str(s).replace("$", "").replace(",", "").strip())
+    except Exception:
+        return 0.0
+
+def _clean_sym(sym):
+    s = (sym or "").strip().upper()
+    if not s or "^" in s or " " in s:
+        return None
+    return s.replace("/", "-").replace(".", "-")        # BRK/B, BRK.B -> BRK-B (Yahoo style)
+
+def _txt_lines(url):
+    try:
+        r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+        return r.text.splitlines() if r.ok else []
+    except Exception:
+        return []
+
+def _stocks_fallback(exchanges):
+    out = {}
+    if "NASDAQ" in exchanges:
+        # Symbol|Security Name|Market Category|Test Issue|Financial Status|Round Lot Size|ETF|NextShares
+        for ln in _txt_lines("https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt")[1:]:
+            p = ln.split("|")
+            if len(p) > 6 and p[3] == "N" and p[6] == "N":
+                s = _clean_sym(p[0])
+                if s:
+                    out[s] = 0.0
+    if "NYSE" in exchanges:
+        # ACT Symbol|Security Name|Exchange|CQS Symbol|ETF|Round Lot Size|Test Issue|NASDAQ Symbol
+        for ln in _txt_lines("https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt")[1:]:
+            p = ln.split("|")
+            if len(p) > 6 and p[2] == "N" and p[4] == "N" and p[6] == "N":
+                s = _clean_sym(p[0])
+                if s:
+                    out[s] = 0.0
+    return list(out.items())
+
+def stocks_universe(exchanges):
+    """[(symbol, dollar_volume)] for all listed stocks on the chosen exchanges (cached 1h)."""
+    store = _store()
+    key = ("__uni__", "stocks", tuple(sorted(exchanges)))
+    with _CACHE_LOCK:
+        hit = store.get(key)
+    if hit and time.time() - hit[0] < 3600:
+        return hit[1]
+    out = {}
+    for ex in exchanges:
+        d = fetch(NQ, "/api/screener/stocks",
+                  {"tableonly": "true", "limit": 10000, "offset": 0,
+                   "exchange": ex.lower(), "download": "true"}, headers=NQ_HDR)
+        try:
+            data = (d or {}).get("data") or {}
+            rows = data.get("rows") or (data.get("table") or {}).get("rows") or []
+        except Exception:
+            rows = []
+        for r in rows:
+            s = _clean_sym(r.get("symbol"))
+            if s:
+                out[s] = _num(r.get("volume")) * _num(r.get("lastsale"))
+    pairs = list(out.items()) if out else _stocks_fallback(exchanges)
+    if pairs:
+        with _CACHE_LOCK:
+            store[key] = (time.time(), pairs)
+    return pairs
+
+def _yahoo_chart(sym, interval, rng):
+    d = fetch(YH, f"/v8/finance/chart/{quote(sym)}",
+              {"interval": interval, "range": rng, "includePrePost": "false"})
+    try:
+        res = d["chart"]["result"][0]
+        q = res["indicators"]["quote"][0]
+        off = (res.get("meta") or {}).get("gmtoffset", 0) or 0
+        vols = q.get("volume") or [0] * len(res["timestamp"])
+        rows = [[t, o, h, l, c, v or 0] for t, o, h, l, c, v in
+                zip(res["timestamp"], q["open"], q["high"], q["low"], q["close"], vols)
+                if None not in (o, h, l, c)]
+        return rows, off
+    except Exception:
+        return None, 0
+
+def _resample_4h(rows, off):
+    """Group 60m bars of each session day in blocks of 4 (09:30-13:30, 13:30-16:00 ET)."""
+    out, day, n, cur = [], None, 0, None
+    for t, o, h, l, c, v in rows:
+        d = (t + off) // 86400
+        if d != day:
+            day, n = d, 0
+        if n % 4 == 0:
+            if cur:
+                out.append(cur)
+            cur = [t, o, h, l, c, v]
+        else:
+            cur[2], cur[3], cur[4], cur[5] = max(cur[2], h), min(cur[3], l), c, cur[5] + v
+        n += 1
+    if cur:
+        out.append(cur)
+    return out
+
+def stocks_ohlc(sym, tf):
+    interval, rng = YH_TF[tf]
+    rows, off = _yahoo_chart(sym, interval, rng)
+    if not rows:
+        return None
+    if tf == "4h":
+        rows = _resample_4h(rows, off)
+    return [[r[0] * 1000, r[1], r[2], r[3], r[4], r[5]] for r in rows]     # ms, like the crypto feeds
 
 PROVIDERS = {
     "binance": (binance_universe, binance_ohlc),
     "bybit": (bybit_universe, bybit_ohlc),
     "okx": (okx_universe, okx_ohlc),
+    "yahoo": (None, stocks_ohlc),
 }
 
 @st.cache_resource
 def _store():
     return {}
 
+# Shared cache is written by many worker threads -> guard with a lock and prune it.
+_CACHE_LOCK = threading.Lock()
+_FH_LOCK = threading.Lock()          # serialises Finnhub calls (rate limit)
+_CACHE_MAX = 20000
+
 def get_closes(store, name, sym, tf, ttl=90):
     key = (name, sym, tf)
-    hit = store.get(key)
-    if hit and time.time() - hit[0] < ttl:
-        return hit[1]
-    raw = PROVIDERS[name][1](sym, tf)
-    if not raw:
+    now = time.time()
+    with _CACHE_LOCK:
+        hit = store.get(key)
+    if hit and now - hit[0] < ttl:
+        return hit[1].tolist()
+    try:
+        raw = PROVIDERS[name][1](sym, tf)
+        if not raw:
+            return None
+        arr = np.asarray([float(c[4]) for c in raw][-CLOSES_KEPT:], dtype="float64")
+    except Exception:
         return None
-    closes = [float(c[4]) for c in raw]
-    store[key] = (time.time(), closes)
-    return closes
+    with _CACHE_LOCK:
+        if len(store) >= _CACHE_MAX:
+            for k in [k for k, v in store.items() if now - v[0] >= ttl]:
+                store.pop(k, None)
+            if len(store) >= _CACHE_MAX:             # still full: drop the oldest quarter
+                for k in sorted(store, key=lambda k: store[k][0])[: _CACHE_MAX // 4]:
+                    store.pop(k, None)
+        store[key] = (now, arr)
+    return arr.tolist()
 
 def get_candles(name, sym, tf):
-    raw = PROVIDERS[name][1](sym, tf)
-    if not raw:
+    try:
+        raw = PROVIDERS[name][1](sym, tf)
+        if not raw:
+            return None
+        raw = [(list(r) + [0.0] * 6)[:6] for r in raw]          # [t, o, h, l, c, volume]
+        df = pd.DataFrame(raw, columns=["t", "open", "high", "low", "close", "volume"])
+        df["t"] = pd.to_datetime(df["t"].astype("int64"), unit="ms")
+        return df.astype({c: float for c in ["open", "high", "low", "close", "volume"]}).reset_index(drop=True)
+    except Exception:
         return None
-    df = pd.DataFrame(raw, columns=["t", "open", "high", "low", "close"])
-    df["t"] = pd.to_datetime(df["t"].astype("int64"), unit="ms")
-    return df.astype({c: float for c in ["open", "high", "low", "close"]}).reset_index(drop=True)
 
 # ── Indicators ──────────────────────────────────────────────────
 def ema_series(vals, n):
@@ -189,51 +346,92 @@ def evaluate(rule, p, e50, e200, max_dist):
     return ok50 and ok200 and okx and dok50 and dok200, d50, d200
 
 def scan_symbol(sym, closes_fn, rules, lf, ls, max_dist, live, fast):
-    row, passed, act, fails = {"Symbol": sym}, 0, 0, 0
-    for tf, rule in rules:
-        if all(x == "Any" for x in rule):
-            continue
+    active = [(tf, r) for tf, r in rules if not all(x == "Any" for x in r)]
+    if not active:
+        return None
+    total = len(active)
+    need = max(lf, ls) + 2
+    idx = -1 if live else -2
+    res, passed, fails = {}, 0, 0
+    # Highest timeframe first: fewest bars to download, and the most selective filter,
+    # so fast mode drops most symbols after only 1-2 requests.
+    for tf, rule in sorted(active, key=lambda x: TF_MINUTES[x[0]], reverse=True):
         closes = closes_fn(sym, tf)
-        if not closes or len(closes) < ls + 2:
+        if not closes or len(closes) < need:
             return None
-        idx = -1 if live else -2
-        p = closes[idx]
-        e50, e200 = ema_series(closes, lf)[idx], ema_series(closes, ls)[idx]
+        s_fast, s_slow = ema_series(closes, lf), ema_series(closes, ls)
+        if not s_fast or not s_slow:
+            return None
+        p, e50, e200 = closes[idx], s_fast[idx], s_slow[idx]
+        if e50 <= 0 or e200 <= 0:
+            return None
         ok, d50, d200 = evaluate(rule, p, e50, e200, max_dist)
+        res[tf] = (ok, p, d50, d200)
+        passed += ok
+        fails += (not ok)
+        if fast and fails >= 2:      # can no longer be MATCH or WATCH -> stop fetching
+            break
+    row, price_set = {"Symbol": sym, "Price": 0.0}, False
+    for tf, _ in active:             # columns in the user's timeframe order
+        if tf not in res:
+            continue
+        ok, p, d50, d200 = res[tf]
         row[tf] = "✅" if ok else "❌"
         row[f"{tf} %50"] = round(d50, 2)
         row[f"{tf} %200"] = round(d200, 2)
-        act += 1
-        passed += ok
-        fails += (not ok)
-        row["Price"] = p
-        if fast and fails >= 2:      # can no longer be MATCH or WATCH -> stop fetching
-            break
-    if act == 0:
-        return None
-    total = sum(1 for _, r in rules if not all(x == "Any" for x in r))
+        if not price_set:            # one consistent price (first active TF)
+            row["Price"] = p
+            price_set = True
     row["Passed"] = f"{passed}/{total}"
     row["Status"] = "MATCH" if passed == total else ("WATCH" if total >= 2 and passed == total - 1 else "-")
     row["_score"] = passed / total
     return row
 
+def safe_scan_symbol(*args):
+    """Crash protection: one bad symbol must never kill the whole scan."""
+    try:
+        return scan_symbol(*args)
+    except Exception:
+        return None
+
 @st.cache_data(ttl=120, show_spinner=False)
-def run_scan(order, rules, lf, ls, max_dist, live, top_n, min_vol, fast):
-    bad = ("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT", "USDCUSDT", "FDUSDUSDT", "TUSDUSDT")
+def run_scan(market, order, exchanges, rules, lf, ls, max_dist, live, top_n, min_vol, fast):
     store = _store()
-    best = ("none", [])
-    for name in order:
-        uni_fn, _ = PROVIDERS[name]
-        pairs = [(s, v) for s, v in uni_fn()
-                 if s.endswith("USDT") and not s.endswith(bad) and v >= min_vol]
+
+    if market == "stocks":
+        try:
+            pairs = stocks_universe(exchanges)
+        except Exception:
+            pairs = []
+        if any(v > 0 for _, v in pairs):             # volume known -> apply the floor
+            pairs = [(s, v) for s, v in pairs if v >= min_vol]
         pairs.sort(key=lambda x: x[1], reverse=True)
         syms = [s for s, _ in pairs[:top_n]]
         if not syms:
-            continue
-        fn = partial(get_closes, store, name)
-        with ThreadPoolExecutor(max_workers=24) as ex:
+            return "none", []
+        fn = partial(get_closes, store, "yahoo", ttl=300)
+        with ThreadPoolExecutor(max_workers=STOCK_WORKERS) as ex:
             rows = [r for r in ex.map(
-                lambda s: scan_symbol(s, fn, rules, lf, ls, max_dist, live, fast), syms) if r]
+                lambda s: safe_scan_symbol(s, fn, rules, lf, ls, max_dist, live, fast), syms) if r]
+        return "yahoo", rows
+
+    bad = ("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT", "USDCUSDT", "FDUSDUSDT", "TUSDUSDT")
+    best = ("none", [])
+    for name in order:
+        try:
+            uni_fn, _ = PROVIDERS[name]
+            pairs = [(s, v) for s, v in uni_fn()
+                     if s.endswith("USDT") and not s.endswith(bad) and v >= min_vol]
+            pairs.sort(key=lambda x: x[1], reverse=True)
+            syms = [s for s, _ in pairs[:top_n]]
+            if not syms:
+                continue
+            fn = partial(get_closes, store, name)
+            with ThreadPoolExecutor(max_workers=CRYPTO_WORKERS) as ex:
+                rows = [r for r in ex.map(
+                    lambda s: safe_scan_symbol(s, fn, rules, lf, ls, max_dist, live, fast), syms) if r]
+        except Exception:
+            continue
         if len(rows) > len(best[1]):
             best = (name, rows)
         if len(rows) >= 0.5 * len(syms):
@@ -284,16 +482,17 @@ def monte_carlo(close, entry, sl, tps, rr, long, horizon, n_paths, drift, seed=4
     sign = 1 if long else -1
     risk = abs(entry - sl)
     term_r = np.clip(sign * (term - entry) / risk, -1, None)
-    # 1/3 of the position exits at each TP, SL fixed, leftovers marked to market at horizon end
+    # 1/3 of the position exits at each TP, SL fixed, leftovers marked to market at horizon end.
+    # If SL and a TP are hit on the same bar, SL wins (conservative).
     ev = 0.0
     for t, R in zip(t_tp, rr):
         out = np.where((t < t_sl) & (t <= horizon), R,
-                       np.where((t_sl < t) & (t_sl <= horizon), -1.0, term_r))
+                       np.where((t_sl <= t) & (t_sl <= horizon), -1.0, term_r))
         ev += out.mean() / len(rr)
     return {
         "paths": paths,
         "p_tp": [float(((t < t_sl) & (t <= horizon)).mean()) for t in t_tp],
-        "p_sl": float(((t_sl < np.minimum.reduce(t_tp)) & (t_sl <= horizon)).mean()),
+        "p_sl": float(((t_sl <= np.minimum.reduce(t_tp)) & (t_sl <= horizon)).mean()),
         "exp_price": float(term.mean()), "median": float(np.median(term)),
         "p5": float(np.percentile(term, 5)), "p95": float(np.percentile(term, 95)),
         "ev_r": float(ev),
@@ -345,20 +544,228 @@ def build_chart(df, lf, ls, entry, sl, tps, mc, tf, long, bars=160):
                       legend=dict(orientation="h", y=1.04), title=f"{'LONG' if long else 'SHORT'} plan")
     return fig
 
+# ── Extra signals: breakout · crash risk · open interest · analyst rating ──
+BY_OI = {"15m": "15min", "1h": "1h", "4h": "4h", "1d": "1d", "1w": "1d"}
+BN_OI = {"15m": "15m", "1h": "1h", "4h": "4h", "1d": "1d", "1w": "1d"}
+BN_F = ["https://fapi.binance.com"]
+FH = ["https://finnhub.io"]
+
+def _clip01(x):
+    return float(min(max(x, 0.0), 1.0))
+
+def breakout_signal(df, n=20, vol_mult=1.5, live=True):
+    """Close vs the previous n-bar high/low. +VOL = volume >= vol_mult x 20-bar average,
+    +SQZ = Bollinger bandwidth was in its lowest 20% just before the break.
+    (A live bar has only partial volume; turn 'live price' off for closed-bar confirmation.)"""
+    d = df if live else df.iloc[:-1]
+    if len(d) < n + 25:
+        return None
+    last_close = float(d["close"].iloc[-1])
+    prev = d.iloc[-(n + 1):-1]
+    hi, lo = float(prev["high"].max()), float(prev["low"].min())
+    vavg = float(d["volume"].iloc[-21:-1].mean())
+    vol_ok = vavg > 0 and float(d["volume"].iloc[-1]) >= vol_mult * vavg
+    c = d["close"]
+    bw = (c.rolling(20).std() * 4 / c.rolling(20).mean()).iloc[:-1].dropna().iloc[-120:]
+    squeeze = len(bw) >= 40 and float(bw.iloc[-1]) <= float(bw.quantile(0.2))
+    if last_close > hi:
+        return "🚀 BREAKOUT" + (" +VOL" if vol_ok else "") + (" +SQZ" if squeeze else "")
+    if last_close < lo:
+        return "🔻 BREAKDOWN" + (" +VOL" if vol_ok else "")
+    if hi > 0 and last_close >= hi * 0.99:
+        return f"⏳ near high ({(last_close / hi - 1) * 100:+.1f}%)"
+    return "-"
+
+def crash_score(df, live=True):
+    """0-100 crash-risk score (higher = more dangerous). Everything is ATR-normalised so it
+    is comparable across coins and stocks. Returns (score, detail) or None."""
+    d = df if live else df.iloc[:-1]
+    if len(d) < 60:
+        return None
+    c = d["close"]
+    a = atr(d)
+    a_now = float(a.iloc[-1])
+    if not np.isfinite(a_now) or a_now <= 0:
+        return None
+    price = float(c.iloc[-1])
+    s_dd = _clip01((float(d["high"].iloc[-60:].max()) - price) / a_now / 10)       # drawdown, 10 ATR = max
+    s_vol = _clip01((a_now / float(a.iloc[-100:].mean()) - 1) / 1.5)                # volatility spike
+    vavg = d["volume"].rolling(20).mean().shift(1)
+    big_red = ((d["open"] - d["close"]) >= a) & (d["volume"] > 1.5 * vavg)         # heavy-volume red bars
+    s_red = _clip01(float(big_red.iloc[-10:].sum()) / 3)
+    cl = c.tolist()
+    e50, e200 = ema_series(cl, 50), ema_series(cl, 200)
+    s_trend = 0.0
+    if e50 and price < e50[-1]:
+        s_trend += 0.4
+    if e200 and price < e200[-1]:
+        s_trend += 0.4
+    if e50 and e200 and e50[-1] < e200[-1]:
+        s_trend += 0.2
+    s_mom = _clip01(-(price - float(c.iloc[-6])) / a_now / 4)                       # 5-bar fall, 4 ATR = max
+    score = 100 * (0.25 * s_dd + 0.15 * s_vol + 0.20 * s_red + 0.25 * s_trend + 0.15 * s_mom)
+    detail = (f"drawdown {s_dd * 100:.0f} · volatility {s_vol * 100:.0f} · red/volume {s_red * 100:.0f} · "
+              f"trend loss {s_trend * 100:.0f} · momentum {s_mom * 100:.0f}")
+    return int(round(score)), detail
+
+def oi_history(sym, tf):
+    """Open-interest series (oldest -> newest) from a USDT perpetual, or None if there is none.
+    Bybit first, Binance futures as fallback (Binance is geo-blocked in some regions)."""
+    d = fetch(BY, "/v5/market/open-interest",
+              {"category": "linear", "symbol": sym, "intervalTime": BY_OI[tf], "limit": 200})
+    try:
+        vals = [float(x["openInterest"]) for x in reversed(d["result"]["list"])]
+        if len(vals) >= 3:
+            return vals
+    except Exception:
+        pass
+    d = fetch(BN_F, "/futures/data/openInterestHist", {"symbol": sym, "period": BN_OI[tf], "limit": 200})
+    try:
+        vals = [float(x["sumOpenInterest"]) for x in d]
+        if len(vals) >= 3:
+            return vals
+    except Exception:
+        pass
+    return None
+
+def oi_signal(sym, tf, cdf, lb, live):
+    oi = oi_history(sym, tf)
+    if not oi:
+        return "n/a (no perp)"
+    if not live:
+        oi = oi[:-1]
+    d = cdf if live else cdf.iloc[:-1]
+    ob = lb * 7 if tf == "1w" else lb          # weekly uses daily OI
+    if len(oi) <= ob or len(d) <= lb or oi[-1 - ob] <= 0:
+        return "n/a"
+    oc = (oi[-1] / oi[-1 - ob] - 1) * 100
+    up = float(d["close"].iloc[-1]) > float(d["close"].iloc[-1 - lb])
+    if oc >= 2:
+        return f"🟢 OI↑ {oc:+.1f}% (longs building)" if up else f"🔴 OI↑ {oc:+.1f}% (shorts building)"
+    if oc <= -2:
+        return f"🟡 OI↓ {oc:+.1f}% (short covering)" if up else f"🟠 OI↓ {oc:+.1f}% (long exits)"
+    return f"➖ OI flat {oc:+.1f}%"
+
+def _analyst_label(r):
+    sb, b, h = r.get("strongBuy") or 0, r.get("buy") or 0, r.get("hold") or 0
+    s, ss = r.get("sell") or 0, r.get("strongSell") or 0
+    n = sb + b + h + s + ss
+    if n == 0:
+        return "n/a", None
+    sc = (2 * sb + b - s - 2 * ss) / n                       # -2 .. +2
+    lab = ("Strong Buy" if sc >= 1.2 else "Buy" if sc >= 0.4 else "Hold" if sc > -0.4
+           else "Sell" if sc > -1.2 else "Strong Sell")
+    return f"{lab} ({n})", sc
+
+def analyst_rating(sym, key):
+    """(label, score) from Finnhub recommendation trends; cached 24h, ~1 call/second."""
+    store = _store()
+    k = ("__fh__", sym)
+    with _CACHE_LOCK:
+        hit = store.get(k)
+    if hit and time.time() - hit[0] < 86400:
+        return hit[1]
+    with _FH_LOCK:
+        time.sleep(1.05)
+        d = fetch(FH, "/api/v1/stock/recommendation", {"symbol": sym.replace("-", "."), "token": key})
+    if not isinstance(d, list):
+        return "n/a", None                                   # error / rate limit: do not cache
+    res = _analyst_label(max(d, key=lambda r: r.get("period", ""))) if d else ("n/a", None)
+    with _CACHE_LOCK:
+        store[k] = (time.time(), res)
+    return res
+
+@st.cache_data(ttl=300, show_spinner=False)
+def enrich_rows(market, src, syms, tf, n_break, vol_mult, live, oi_lb, fh_key):
+    stocks = market == "stocks"
+
+    def one(s):
+        out = {"Breakout": "n/a", "Crash": None}
+        try:
+            cdf = get_candles(src, s, tf)
+            if cdf is None or len(cdf) < 30:
+                return s, out
+            out["Breakout"] = breakout_signal(cdf, n_break, vol_mult, live) or "n/a"
+            cs = crash_score(cdf, live)
+            out["Crash"] = cs[0] if cs else None
+            if not stocks:
+                out["OI"] = oi_signal(s, tf, cdf, oi_lb, live)
+        except Exception:
+            pass
+        return s, out
+
+    with ThreadPoolExecutor(max_workers=8 if stocks else 16) as ex:
+        res = dict(ex.map(one, syms))
+    if stocks and fh_key:
+        for i, s in enumerate(syms):
+            if i >= ANALYST_MAX:
+                res[s]["Analyst"] = "limit"
+                continue
+            label, score = analyst_rating(s, fh_key)
+            res[s]["Analyst"], res[s]["_as"] = label, score
+    return res
+
+@st.cache_data(ttl=300, show_spinner=False)
+def market_regime(market, src):
+    """Benchmark trend: BTC (crypto) or SPY (stocks) on 1D."""
+    sym = "SPY" if market == "stocks" else "BTCUSDT"
+    df = get_candles(src, sym, "1d")
+    if df is None or len(df) < 210:
+        return None
+    c = df["close"].tolist()
+    p, e50, e200 = c[-1], ema_series(c, 50)[-1], ema_series(c, 200)[-1]
+    cs = crash_score(df, True)
+    state = "RISK-OFF" if p < e200 else ("CAUTION" if p < e50 else "RISK-ON")
+    return {"sym": sym, "state": state, "d200": (p / e200 - 1) * 100, "crash": cs[0] if cs else None}
+
 # ── Sidebar ─────────────────────────────────────────────────────
 st.sidebar.header("⚙️ Settings")
+market = MARKETS[st.sidebar.radio("Market", list(MARKETS))]
+is_stocks = market == "stocks"
+ccy = "USD" if is_stocks else "USDT"
+
 live = st.sidebar.toggle("Use live price (off = last closed candle)", True)
 lf = st.sidebar.number_input("EMA fast", 1, 500, 50)
 ls = st.sidebar.number_input("EMA slow", 1, 500, 200)
 max_dist = st.sidebar.number_input("Max distance from EMA (%), 0 = off", 0.0, 100.0, 0.0, 0.5)
-top_n = st.sidebar.slider("Top N coins by volume", 20, 1000, 400, 20)
-min_vol = st.sidebar.number_input("Min 24h volume (USDT)", 0, 10**10, 1_000_000, 500_000)
+top_n = st.sidebar.slider("Top N by volume", 20, 8000, 1500, 50,
+                          help="Crypto exchanges list a few hundred to ~1000 USDT pairs. "
+                               "NASDAQ + NYSE together have ~6,000+ tickers: use the maximum to scan all of them.")
+if is_stocks:
+    min_vol = st.sidebar.number_input("Min daily $ volume (USD)", 0, 10**11, 1_000_000, 500_000)
+    exch = st.sidebar.multiselect("Exchanges", STOCK_EXCH, default=STOCK_EXCH)
+    order = []
+else:
+    min_vol = st.sidebar.number_input("Min 24h volume (USDT)", 0, 10**10, 100_000, 50_000)
+    order = st.sidebar.multiselect("Data sources (priority order)", ["okx", "bybit", "binance"],
+                                   default=["okx", "bybit", "binance"])
+    exch = []
 fast = st.sidebar.toggle("Fast mode (stop after 2 failed TFs)", True,
                          help="Much fewer API calls; MATCH/WATCH results are identical.")
-order = st.sidebar.multiselect("Data sources (priority order)", ["okx", "bybit", "binance"],
-                               default=["okx", "bybit", "binance"])
 refresh = st.sidebar.slider("Auto-refresh (minutes, 0 = off)", 0, 30, 0)
 alerts = st.sidebar.toggle("Telegram alerts (needs secrets)", False)
+
+st.sidebar.subheader("Extra signals")
+extras_on = st.sidebar.toggle("Breakout · crash risk · OI · analyst (MATCH/WATCH rows)", True,
+                              help="Computed only for MATCH/WATCH rows, so the extra API cost is small.")
+sig_tf = st.sidebar.selectbox("Signal timeframe", TFS, index=3)
+n_break = st.sidebar.slider("Breakout lookback (bars)", 10, 100, 20)
+vol_mult = st.sidebar.number_input("Breakout volume x average", 1.0, 10.0, 1.5, 0.1)
+oi_lb = st.sidebar.slider("OI / price change lookback (bars)", 2, 30, 5)
+crash_max = st.sidebar.slider("Crash protector: hide MATCH/WATCH with risk ≥ (100 = off)", 10, 100, 100, 5,
+                              help="Meant for long setups. Leave at 100 when scanning for shorts.")
+req_break = st.sidebar.toggle("Only breakouts", False)
+req_oi = False
+min_analyst = "Any"
+fh_key = ""
+if is_stocks:
+    min_analyst = st.sidebar.selectbox("Min analyst rating", ["Any"] + list(ANALYST_MIN))
+    try:
+        fh_key = st.secrets["FINNHUB_KEY"]
+    except Exception:
+        fh_key = st.sidebar.text_input("Finnhub API key (free) for analyst ratings", type="password")
+else:
+    req_oi = st.sidebar.toggle("Only OI rising with price up", False)
 
 st.sidebar.subheader("EMA criteria presets")
 preset_name = st.sidebar.selectbox(
@@ -391,25 +798,85 @@ if refresh:
 
 # ── Main ────────────────────────────────────────────────────────
 st.markdown('<div class="hero"><h2>📈 MTF EMA Screener Pro</h2>'
-            '<span>Multi-timeframe EMA scan · trade planner · Monte Carlo</span></div>', unsafe_allow_html=True)
+            '<span>Multi-timeframe EMA scan · crypto + US stocks · trade planner · Monte Carlo</span></div>',
+            unsafe_allow_html=True)
 if st.button("🔄 Scan now"):
     run_scan.clear()
 
-if not order:
+if is_stocks and not exch:
+    st.warning("Select at least one exchange.")
+    st.stop()
+if not is_stocks and not order:
     st.warning("Select at least one data source.")
     st.stop()
 
+if all(all(x == "Any" for x in r) for _, r in rules):
+    st.warning("All rules are set to 'Any' - pick at least one condition.")
+    st.stop()
+
 t0 = time.time()
-with st.spinner(f"Scanning up to {top_n} coins..."):
-    provider, rows = run_scan(tuple(order), tuple(rules), lf, ls, max_dist, live, top_n, min_vol, fast)
+spin = (f"Scanning up to {top_n} stocks... the first full scan can take several minutes "
+        "(later scans reuse the cache)") if is_stocks else f"Scanning up to {top_n} coins..."
+with st.spinner(spin):
+    try:
+        provider, rows = run_scan(market, tuple(order), tuple(exch), tuple(rules), lf, ls,
+                                  max_dist, live, top_n, min_vol, fast)
+    except Exception as e:
+        provider, rows = "none", []
+        st.error(f"Scan crashed: {e}")
 
 if not rows:
+    run_scan.clear()   # never keep a failed/empty result cached for 2 minutes
     st.error("All data sources failed. Try another source order or retry in a minute.")
     st.stop()
 
+data_src = "yahoo" if is_stocks else provider      # provider key used for candle downloads
+
 df = pd.DataFrame(rows).sort_values(["_score", "Symbol"], ascending=[False, True]).drop(columns="_score")
+_lead = ["Symbol", "Price"] + [c for tf in TFS for c in (tf, f"{tf} %50", f"{tf} %200") if c in df.columns]
+df = df[_lead + [c for c in df.columns if c not in _lead]]          # stable column order (fast mode skips TFs)
 match = df[df["Status"] == "MATCH"]
 watch = df[df["Status"] == "WATCH"]
+
+# ── Extra signals (MATCH/WATCH rows only) + filters ─────────────
+extra, as_map, regime, hidden = {}, {}, None, 0
+if extras_on:
+    pool_syms = (list(match["Symbol"]) + list(watch["Symbol"]))[:ENRICH_MAX]
+    if pool_syms:
+        with st.spinner("Computing extra signals..."):
+            try:
+                extra = enrich_rows(market, data_src, tuple(pool_syms), sig_tf, n_break, vol_mult,
+                                    live, oi_lb, fh_key)
+            except Exception as e:
+                st.warning(f"Extra signals failed: {e}")
+    try:
+        regime = market_regime(market, data_src)
+    except Exception:
+        regime = None
+    for col in ("Breakout", "Crash", "OI", "Analyst"):
+        if any(col in v for v in extra.values()):
+            df[col] = df["Symbol"].map(lambda s, c=col: extra.get(s, {}).get(c))
+    if "Crash" in df.columns:
+        df["Crash"] = pd.to_numeric(df["Crash"], errors="coerce")
+    as_map = {s: v.get("_as") for s, v in extra.items()}
+
+    def keep(frame):
+        f = frame
+        if "Crash" in f.columns and crash_max < 100:
+            f = f[~(f["Crash"] >= crash_max)]                       # NaN (unknown) is kept
+        if req_break and "Breakout" in f.columns:
+            f = f[f["Breakout"].astype(str).str.startswith("🚀")]
+        if req_oi and "OI" in f.columns:
+            f = f[f["OI"].astype(str).str.startswith("🟢")]
+        if min_analyst != "Any" and any(v is not None for v in as_map.values()):
+            f = f[pd.to_numeric(f["Symbol"].map(as_map), errors="coerce") >= ANALYST_MIN[min_analyst]]
+        return f
+
+    match = df[df["Status"] == "MATCH"]
+    watch = df[df["Status"] == "WATCH"]
+    n_before = len(match) + len(watch)
+    match, watch = keep(match), keep(watch)
+    hidden = n_before - len(match) - len(watch)
 
 m1, m2, m3, m4, m5 = st.columns(5)
 m1.metric("Scanned", len(df))
@@ -417,36 +884,47 @@ m2.metric("🟢 MATCH", len(match))
 m3.metric("👀 WATCH", len(watch))
 m4.metric("Source", provider.upper())
 m5.metric("Scan time", f"{time.time() - t0:.1f}s")
-st.caption(f"Updated {time.strftime('%H:%M:%S')} (UTC)")
+st.caption(f"Updated {time.strftime('%H:%M:%S', time.gmtime())} (UTC)")
+if regime:
+    icon = {"RISK-ON": "🟢", "CAUTION": "🟡", "RISK-OFF": "🔴"}[regime["state"]]
+    rc = "n/a" if regime["crash"] is None else f"{regime['crash']}/100"
+    st.markdown(f"{icon} **Market regime: {regime['state']}** · {regime['sym']} 1D is "
+                f"{regime['d200']:+.1f}% vs EMA200 · benchmark crash score {rc}")
+if hidden:
+    st.caption(f"{hidden} MATCH/WATCH rows hidden by the extra-signal filters (still visible in the All tab).")
 
 now = set(match["Symbol"])
-prev = st.session_state.get("prev_matches")
+pkey = f"prev_matches_{market}"          # separate state per market -> no false alerts on switch
+prev = st.session_state.get(pkey)
 if alerts and prev is not None:
     for s in now - prev:
         telegram(f"ENTRY: {s} - all MTF EMA rules matched")
     for s in prev - now:
         telegram(f"EXIT: {s} - MTF EMA rules no longer matched")
-st.session_state["prev_matches"] = now
+st.session_state[pkey] = now
 
 pct_cols = {c: st.column_config.NumberColumn(c, format="%.2f%%") for c in df.columns if "%" in c}
 cfg = {"Price": st.column_config.NumberColumn("Price", format="%.6g"), **pct_cols}
+if "Crash" in df.columns:
+    cfg["Crash"] = st.column_config.ProgressColumn("Crash risk", min_value=0, max_value=100, format="%d")
 t1, t2, t3, t4 = st.tabs(["✅ MATCH", "👀 WATCH", "All", "🎯 Trade planner"])
-for tab, data in ((t1, match), (t2, watch), (t3, df)):
+for key, tab, data in (("match", t1, match), ("watch", t2, watch), ("all", t3, df)):
     with tab:
         if data.empty:
             st.info("Nothing here right now.")
         else:
-            st.dataframe(data, use_container_width=True, hide_index=True, column_config=cfg)
-            st.download_button("⬇️ CSV", data.to_csv(index=False), "screener.csv", key=f"dl{id(tab)}")
+            st.dataframe(data, width="stretch", hide_index=True, column_config=cfg)
+            st.download_button("⬇️ CSV", data.to_csv(index=False), f"screener_{market}_{key}.csv",
+                               key=f"dl_{key}")
 
 # ── Trade planner ───────────────────────────────────────────────
 with t4:
     pool = list(match["Symbol"]) + list(watch["Symbol"])
     if not pool:
-        st.info("No MATCH/WATCH coins to plan right now.")
+        st.info("No MATCH/WATCH symbols to plan right now.")
     else:
         k1, k2, k3, k4 = st.columns(4)
-        sym = k1.selectbox("Coin", pool, format_func=lambda s: f"{'🟢' if s in now else '👀'} {s}")
+        sym = k1.selectbox("Symbol", pool, format_func=lambda s: f"{'🟢' if s in now else '👀'} {s}")
         ctf = k2.selectbox("Chart / entry TF", TFS, index=2)
         dirn = k3.selectbox("Direction", ["Auto", "Long", "Short"])
         sl_mode = k4.selectbox("Stop-loss", ["ATR", "Swing (10 bars)"])
@@ -457,51 +935,75 @@ with t4:
         n_paths = k8.select_slider("MC paths", [1000, 2000, 5000, 10000], 5000)
         k9, k10, k11 = st.columns(3)
         drift = k9.toggle("Include historical drift", True)
-        equity = k10.number_input("Account size (USDT)", 10.0, 1e9, 1000.0, 100.0)
+        equity = k10.number_input(f"Account size ({ccy})", 10.0, 1e9, 1000.0, 100.0)
         risk_pct = k11.number_input("Risk per trade (%)", 0.1, 10.0, 1.0, 0.1)
 
         try:
             rr = [float(x) for x in rr_txt.split(",")][:3]
             assert len(rr) == 3 and all(x > 0 for x in rr)
         except Exception:
+            rr = None
             st.error("Enter three positive R multiples, e.g. 1,2,3")
-            st.stop()
 
-        cdf = get_candles(provider, sym, ctf)
-        if cdf is None or len(cdf) < ls + 5:
-            st.error("Could not load candles for this coin/timeframe.")
+        cdf = get_candles(data_src, sym, ctf) if rr else None
+        if rr is None:
+            pass
+        elif cdf is None or len(cdf) < max(lf, ls) + 5:
+            st.error("Could not load candles for this symbol/timeframe.")
         else:
-            closes = cdf["close"].tolist()
-            e50, e200 = ema_series(closes, lf)[-1], ema_series(closes, ls)[-1]
-            p = closes[-1]
-            auto = "Long" if (p > e200 and e50 >= e200) else "Short" if (p < e200 and e50 <= e200) else \
-                   ("Long" if p > e200 else "Short")
-            direction = auto if dirn == "Auto" else dirn
-            long = direction == "Long"
-            entry, sl, tps, risk = trade_plan(cdf, direction, sl_mode, atr_mult, rr)
-            mc = monte_carlo(cdf["close"].values, entry, sl, tps, rr, long, horizon, n_paths, drift)
-            qty = (equity * risk_pct / 100) / risk
+            try:
+                closes = cdf["close"].tolist()
+                e50, e200 = ema_series(closes, lf)[-1], ema_series(closes, ls)[-1]
+                p = closes[-1]
+                auto = "Long" if (p > e200 and e50 >= e200) else "Short" if (p < e200 and e50 <= e200) else \
+                       ("Long" if p > e200 else "Short")
+                direction = auto if dirn == "Auto" else dirn
+                long = direction == "Long"
+                entry, sl, tps, risk = trade_plan(cdf, direction, sl_mode, atr_mult, rr)
+                if not np.isfinite(risk) or risk <= entry * 1e-6:
+                    raise ValueError("Stop distance is ~0 (flat candles / bad ATR). Try another SL mode or TF.")
+                mc = monte_carlo(cdf["close"].values, entry, sl, tps, rr, long, horizon, n_paths, drift)
+                qty = (equity * risk_pct / 100) / risk
+                if is_stocks:
+                    qty = float(int(qty))          # whole shares
+                pos_txt = f"{qty:,.0f} shares" if is_stocks else f"{qty:,.4f} {sym[:-4]}"
 
-            left, right = st.columns([3, 1.1])
-            left.plotly_chart(build_chart(cdf, lf, ls, entry, sl, tps, mc, ctf, long),
-                              use_container_width=True)
-            with right:
-                st.markdown(f"### {sym} · {'🟢 LONG' if long else '🔴 SHORT'}")
-                st.markdown(f'<div class="lvl entry">ENTRY<span>{fmt(entry)}</span></div>'
-                            f'<div class="lvl sl">SL<span>{fmt(sl)} <small>({abs(sl/entry-1)*100:.2f}%)</small></span></div>',
-                            unsafe_allow_html=True)
-                for i, (tp, R, pr) in enumerate(zip(tps, rr, mc["p_tp"])):
-                    st.markdown(f'<div class="lvl tp">TP{i+1} · {R:g}R<span>{fmt(tp)} '
-                                f'<small>P={pr*100:.0f}%</small></span></div>', unsafe_allow_html=True)
-                st.markdown(f'<div class="lvl exp">Expected price<span>{fmt(mc["exp_price"])} '
-                            f'<small>({(mc["exp_price"]/entry-1)*100:+.2f}%)</small></span></div>',
-                            unsafe_allow_html=True)
-                st.metric("P(SL before any TP)", f"{mc['p_sl']*100:.0f}%")
-                st.metric("Expected value (R)", f"{mc['ev_r']:+.2f}R",
-                          help="1/3 of the position exits at each TP; leftovers marked at horizon end.")
-                st.metric("Median / 5–95% range",
-                          f"{fmt(mc['median'])}", f"{fmt(mc['p5'])} – {fmt(mc['p95'])}", delta_color="off")
-                st.metric("Position size", f"{qty:,.4f} {sym[:-4]}",
-                          f"≈ {qty * entry:,.0f} USDT · risk {equity * risk_pct / 100:,.2f}", delta_color="off")
-            st.caption("Monte Carlo = bootstrap of the last ≤500 log-returns on the chosen timeframe; "
-                       "hits are checked on closes. A statistical estimate, not a prediction or financial advice.")
+                left, right = st.columns([3, 1.1])
+                left.plotly_chart(build_chart(cdf, lf, ls, entry, sl, tps, mc, ctf, long),
+                                  width="stretch")
+                with right:
+                    st.markdown(f"### {sym} · {'🟢 LONG' if long else '🔴 SHORT'}")
+                    st.markdown(f'<div class="lvl entry">ENTRY<span>{fmt(entry)}</span></div>'
+                                f'<div class="lvl sl">SL<span>{fmt(sl)} <small>({abs(sl/entry-1)*100:.2f}%)</small></span></div>',
+                                unsafe_allow_html=True)
+                    for i, (tp, R, pr) in enumerate(zip(tps, rr, mc["p_tp"])):
+                        st.markdown(f'<div class="lvl tp">TP{i+1} · {R:g}R<span>{fmt(tp)} '
+                                    f'<small>P={pr*100:.0f}%</small></span></div>', unsafe_allow_html=True)
+                    st.markdown(f'<div class="lvl exp">Expected price<span>{fmt(mc["exp_price"])} '
+                                f'<small>({(mc["exp_price"]/entry-1)*100:+.2f}%)</small></span></div>',
+                                unsafe_allow_html=True)
+                    st.metric("P(SL before any TP)", f"{mc['p_sl']*100:.0f}%")
+                    st.metric("Expected value (R)", f"{mc['ev_r']:+.2f}R",
+                              help="1/3 of the position exits at each TP; leftovers marked at horizon end.")
+                    st.metric("Median / 5–95% range",
+                              f"{fmt(mc['median'])}", f"{fmt(mc['p5'])} – {fmt(mc['p95'])}", delta_color="off")
+                    st.metric("Position size", pos_txt,
+                              f"≈ {qty * entry:,.0f} {ccy} · risk {equity * risk_pct / 100:,.2f}", delta_color="off")
+                    bo = breakout_signal(cdf, n_break, vol_mult, live)
+                    cs = crash_score(cdf, live)
+                    st.metric(f"Breakout ({ctf})", bo or "n/a")
+                    st.metric(f"Crash risk ({ctf})", f"{cs[0]}/100" if cs else "n/a",
+                              help=cs[1] if cs else None)
+                    exs = extra.get(sym, {})
+                    if exs.get("OI"):
+                        st.metric(f"Open interest ({sig_tf})", exs["OI"])
+                    if exs.get("Analyst"):
+                        st.metric("Analyst rating", exs["Analyst"])
+                st.caption("Monte Carlo = bootstrap of the last ≤500 log-returns on the chosen timeframe; "
+                           "hits are checked on closes. A statistical estimate, not a prediction or financial advice.")
+                if is_stocks:
+                    st.caption("Stocks: regular-session bars only; 4H bars are built from 1H "
+                               "(09:30–13:30 and 13:30–16:00 ET); times shown in UTC. "
+                               "Stops/gaps overnight are not modelled.")
+            except Exception as e:
+                st.error(f"Trade planner error: {e}")

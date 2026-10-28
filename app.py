@@ -973,7 +973,7 @@ def add_walls(fig, lv):
     return fig
 
 # ── Footprint-style volume at price from recent trades (crypto) ──────────────
-def get_trades_raw(src, sym):
+def _get_trades_raw(src, sym):
     """[(price, qty, taker_is_buy)] for the most recent trades, or None.
     Bybit spot recent-trade is capped at ~60 rows, so the linear perp (up to 1000) is tried first."""
     try:
@@ -1343,7 +1343,7 @@ for key, tab, data in (("match", t1, match), ("watch", t2, watch), ("all", t3, d
         if data.empty:
             st.info("Nothing here right now.")
         else:
-            st.dataframe(data, width="stretch", hide_index=True, column_config=cfg)
+            st.dataframe(data, width="content", hide_index=True, column_config=cfg)
             st.download_button("⬇️ CSV", data.to_csv(index=False), f"screener_{market}_{key}.csv",
                                key=f"dl_{key}")
 

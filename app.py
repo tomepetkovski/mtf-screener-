@@ -1319,6 +1319,7 @@ _SCHEMA = """CREATE TABLE IF NOT EXISTS signals(
 def _db():
     con = sqlite3.connect(JOURNAL_DB, timeout=10)
     con.execute(_SCHEMA)
+    _migrate(con)
     return con
 
 def _py(v):
@@ -1488,11 +1489,12 @@ def journal_resolve(max_n=60):
         if not res:
             continue
         label, r, bars = res
+        mae, mfe = excursions(row, df, bars)
         with _DB_LOCK:
             con = _db()
             try:
-                con.execute("UPDATE signals SET outcome=?, r_result=?, closed_ts=?, bars=? WHERE id=?",
-                            (label, r, time.time(), bars, int(row.id)))
+                con.execute("UPDATE signals SET outcome=?, r_result=?, closed_ts=?, bars=?, mae_r=?, mfe_r=? WHERE id=?",
+                            (label, r, time.time(), bars, mae, mfe, int(row.id)))
                 con.commit()
             finally:
                 con.close()
@@ -1601,6 +1603,14 @@ def render_journal():
         eq = closed.sort_values("closed_ts")["net"].cumsum().reset_index(drop=True)
         st.markdown("**Cumulative R (net of costs)**")
         st.line_chart(eq)
+        mt = mae_table(closed)
+        if mt is not None:
+            st.markdown("**Stop tightness**")
+            st.dataframe(mt, hide_index=True)
+        fw = fit_weights(closed)
+        if fw is not None:
+            st.markdown("**Suggested weights**")
+            st.dataframe(fw, hide_index=True)
 
     show = jdf.drop(columns=["parts", "extras", "risk"]).copy()
     show["ts"] = pd.to_datetime(show["ts"], unit="s")
@@ -1613,7 +1623,7 @@ def render_journal():
 
 # ── Enrichment for MATCH/WATCH rows ─────────────────────────────
 @st.cache_data(ttl=300, show_spinner=False)
-def enrich_rows(market, src, syms, tf, n_break, vol_mult, live, oi_lb, fh_key, long_bias, j_atr, j_rr):
+def enrich_rows(market, src, syms, tf, n_break, vol_mult, live, oi_lb, fh_key, long_bias, j_atr, j_rr, lf_):
     stocks = market == "stocks"
     store = _store()
     bench = get_closes(store, src, "SPY" if stocks else "BTCUSDT", "1d")
@@ -1629,6 +1639,8 @@ def enrich_rows(market, src, syms, tf, n_break, vol_mult, live, oi_lb, fh_key, l
             out["Breakout"] = breakout_signal(cdf, n_break, vol_mult, live) or "n/a"
             cs = crash_score(cdf, live)
             out["Crash"] = cs[0] if cs else None
+            out["_ext"] = ext_atr(cdf, lf_, live)
+            out["_adx"] = adx(cdf)
             fl = volume_flow(cdf, live)
             out["Flow"] = flow_text(fl)
             out["_dz"] = fl[2] if fl else None
@@ -2155,7 +2167,7 @@ if extras_on:
     if extra:
         st_map = dict(zip(df["Symbol"], df["Status"]))
         for s, ex in extra.items():
-            conv_map[s] = conviction(ex, long_bias, st_map.get(s), regime, macro_h)
+            conv_map[s] = conviction2(ex, long_bias, st_map.get(s), regime, macro_h)
         df["Conviction"] = df["Symbol"].map(lambda s: conv_map[s][0] if s in conv_map else None)
 
     as_map = {s: v.get("_as") for s, v in extra.items()}
@@ -2272,7 +2284,7 @@ for _c in ("Breakout", "Flow", "OI", "Book", "Funding", "L/S", "Crowding", "Earn
         if _c in df.columns and _c not in cfg:
             cfg[_c] = st.column_config.TextColumn(_c)
 
-t1, t2, t3, t4, t5 = st.tabs(["✅ MATCH", "👀 WATCH", "All", "🎯 Trade planner", "📒 Journal"])
+t1, t2, t3, t4, t5, t6 = st.tabs(["✅ MATCH", "👀 WATCH", "All", "🎯 Trade planner", "📒 Journal", "🧪 Backtest"])
 for key, tab, data in (("match", t1, match), ("watch", t2, watch), ("all", t3, df)):
     with tab:
         if data.empty:
@@ -2292,7 +2304,7 @@ with t4:
         sym = k1.selectbox("Symbol", pool, format_func=lambda s: f"{'🟢' if s in now else '👀'} {s}")
         ctf = k2.selectbox("Chart / entry TF", TFS, index=2)
         dirn = k3.selectbox("Direction", ["Auto", "Long", "Short"])
-        sl_mode = k4.selectbox("Stop-loss", ["ATR", "Swing (10 bars)", "Wall invalidation"])
+        sl_mode = k4.selectbox("Stop-loss", ["ATR", "Swing (10 bars)", "Wall invalidation", "Structure (clamped ATR)"])
         k5, k6, k7, k8 = st.columns(4)
         atr_mult = k5.number_input("ATR multiple", 0.5, 10.0, 1.5, 0.25)
         rr_txt = k6.text_input("TP in R (TP1,TP2,TP3)", "1,2,3")
@@ -2326,7 +2338,7 @@ with t4:
                 p = closes[-1]
                 auto = "Long" if (p > e200 and e50 >= e200) else "Short" if (p < e200 and e50 <= e200) else \
                        ("Long" if p > e200 else "Short")
-                direction = auto if dirn == "Auto" else dirn
+                direction = ("Long" if long_bias else "Short") if dirn == "Auto" else dirn
                 long = direction == "Long"
                 px_last = float(cdf["close"].iloc[-1])
                 lv = None
@@ -2339,7 +2351,10 @@ with t4:
                 limit_px = sug["entry"] if (sug and entry_mode == "Wall limit") else None
                 if entry_mode == "Wall limit" and not sug:
                     st.caption("No wall found on this side: using market entry.")
-                entry, sl, tps, risk = trade_plan(cdf, direction, sl_mode, atr_mult, rr, entry=limit_px)
+                if sl_mode.startswith("Structure"):
+                    entry, sl, tps, risk = trade_plan_v2(cdf, direction, rr, entry=limit_px)
+                else:
+                    entry, sl, tps, risk = trade_plan(cdf, direction, sl_mode, atr_mult, rr, entry=limit_px)
                 if sl_mode == "Wall invalidation" and sug:
                     sl = sug.get("invalid_below") or sug.get("invalid_above")
                     risk = abs(entry - sl)
@@ -2358,11 +2373,19 @@ with t4:
                            "_dz": fl[2] if fl else None, "_imb": lv["imbalance_w"] if lv else None,
                            "_as": exs.get("_as"), "_crowd": exs.get("_crowd"), "_rs": exs.get("_rs"),
                            "_ed": exs.get("_ed")}
-                cv, parts = conviction(ex_live, long, "MATCH" if sym in now else "WATCH", regime, macro_h)
+                cv, parts = conviction2(ex_live, long, "MATCH" if sym in now else "WATCH", regime, macro_h)
                 blocked = blocked_tps(lv, entry, tps, long)
                 qty = (equity * risk_pct / 100) / risk
                 if is_stocks:
                     qty = float(int(qty))
+                dd = get_candles(data_src, sym, "1d")
+                lc = liquidity_cap_qty(dd, entry)
+                if lc and qty > lc:
+                    qty = lc
+                    st.caption("Size capped at 1% of average daily $ volume")
+                heat = open_heat(risk_pct)
+                if heat + risk_pct > 6:
+                    st.warning(f"Portfolio heat would be {heat + risk_pct:.1f}% of equity")
                 pos_txt = f"{qty:,.0f} shares" if is_stocks else f"{qty:,.4f} {sym[:-4]}"
 
                 left, right = st.columns([3, 1.1])

@@ -1690,6 +1690,291 @@ def market_regime(market, src):
     state = "RISK-OFF" if p < e200 else ("CAUTION" if p < e50 else "RISK-ON")
     return {"sym": sym, "state": state, "d200": (p / e200 - 1) * 100, "crash": cs[0] if cs else None}
 
+
+# ── 1. Entry-quality features: extension from EMA (in ATR) + trend strength ──
+def ext_atr(df, lf, live=True):
+    """Signed distance of price from the fast EMA in ATR units (+ = above)."""
+    d = df if live else df.iloc[:-1]
+    if len(d) < 30:
+        return None
+    c = d["close"].tolist()
+    e = ema_series(c, lf)
+    a = float(atr(d).iloc[-1])
+    if not e or not np.isfinite(a) or a <= 0:
+        return None
+    return (c[-1] - e[-1]) / a
+
+
+def adx(df, n=14):
+    """Wilder ADX (trend strength, direction-agnostic)."""
+    up, dn = df["high"].diff(), -df["low"].diff()
+    pdm = pd.Series(np.where((up > dn) & (up > 0), up, 0.0), index=df.index)
+    mdm = pd.Series(np.where((dn > up) & (dn > 0), dn, 0.0), index=df.index)
+    a = atr(df, n)
+    pdi = 100 * pdm.ewm(alpha=1 / n, adjust=False).mean() / a
+    mdi = 100 * mdm.ewm(alpha=1 / n, adjust=False).mean() / a
+    dx = 100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan)
+    v = float(dx.ewm(alpha=1 / n, adjust=False).mean().iloc[-1])
+    return v if np.isfinite(v) else None
+
+
+def conviction2(ex, long, status, regime, macro_h=None):
+    """Original conviction + 'Extend' (don't chase) + 'Trend' (ADX) + coverage cap.
+    ex needs the extra keys '_ext' and '_adx' (set them in enrich_rows.one())."""
+    score, p = conviction(ex, long, status, regime, macro_h)
+    sg = 1 if long else -1
+    ok = lambda v: v is not None and np.isfinite(v)
+    if ok(ex.get("_ext")):
+        e = sg * ex["_ext"]                       # ATR distance in the trade direction
+        p["Extend"] = 5 if 0 <= e <= 1.5 else (-min(12.0, 3 * (e - 2)) if e > 3 else 0.0)
+    if ok(ex.get("_adx")):
+        p["Trend"] = 5 if ex["_adx"] >= 25 else (-6 if ex["_adx"] < 15 else 0)
+    score = int(round(max(0, min(100, 50 + sum(p.values())))))
+    core = ("Flow", "Crash", "Regime", "RelStr", "Extend", "Trend")
+    cov = sum(k in p for k in core) / len(core)
+    if cov < 0.5:                                 # little data must not look like a high grade
+        score = min(score, 64)
+    return score, p
+
+DRIVER_HELP.update({
+    "Extend": "Distance from fast EMA in ATR: pullbacks score, chasing (>3 ATR) is penalised",
+    "Trend": "ADX: trending (>=25) helps, chop (<15) hurts",
+})
+
+
+# ── 2. Structure stop, clamped by ATR (swing stops on 1D/1W can be absurdly wide) ──
+def trade_plan_v2(df, direction, rr, entry=None, min_atr=1.0, max_atr=3.0):
+    entry = float(df["close"].iloc[-1]) if entry is None else entry
+    a = float(atr(df).iloc[-1])
+    long = direction == "Long"
+    sw = df["low"].iloc[-10:].min() - 0.1 * a if long else df["high"].iloc[-10:].max() + 0.1 * a
+    dist = min(max(abs(entry - sw), min_atr * a), max_atr * a)
+    sl = entry - dist if long else entry + dist
+    risk, sign = abs(entry - sl), (1 if long else -1)
+    return entry, sl, [entry + sign * risk * r for r in rr], risk
+
+
+# ── 3. Portfolio heat + liquidity cap for position size ──
+def open_heat(risk_pct):
+    """% of equity currently at risk if every OPEN journal signal is traded at risk_pct."""
+    j = journal_load()
+    return 0.0 if j.empty else float((j["outcome"] == "OPEN").sum()) * risk_pct
+
+
+def liquidity_cap_qty(daily_df, entry, pct=0.01):
+    """Max quantity so the position is <= pct of the average daily dollar volume."""
+    if daily_df is None or len(daily_df) < 5:
+        return None
+    adv = float((daily_df["close"] * daily_df["volume"]).iloc[-20:].mean())
+    return pct * adv / entry if adv > 0 else None
+
+
+# ── 4. MAE / MFE tracking (tells you where stops and targets really belong) ──
+def _migrate(con):
+    have = {r[1] for r in con.execute("PRAGMA table_info(signals)")}
+    for c in ("mae_r", "mfe_r"):
+        if c not in have:
+            con.execute(f"ALTER TABLE signals ADD COLUMN {c} REAL")
+
+
+def excursions(row, df, bars):
+    """(MAE, MFE) in R over the first `bars` candles after the signal."""
+    d = df[df["t"] > pd.to_datetime(int(row.bar_t), unit="ms")].head(max(int(bars), 1))
+    risk = abs(row.entry - row.sl)
+    if d.empty or not risk > 0:
+        return None, None
+    if row.direction == "Long":
+        return (d["low"].min() - row.entry) / risk, (d["high"].max() - row.entry) / risk
+    return (row.entry - d["high"].max()) / risk, (row.entry - d["low"].min()) / risk
+
+
+def mae_table(closed):
+    """Of the trades that ended up winners, how many survive a tighter stop?"""
+    w = closed[(closed["net"] > 0)].dropna(subset=["mae_r"])
+    if len(w) < 10:
+        return None
+    return pd.DataFrame([{"Stop (x current risk)": s, "Winners kept %": round(100 * (w["mae_r"] > -s).mean(), 1)}
+                         for s in (0.4, 0.6, 0.8, 1.0)])
+
+
+# ── 5. Learn the weights from your own journal (suggestion only, never auto-applied) ──
+def fit_weights(closed, lam=30.0, boots=200, min_n=100):
+    """Ridge regression of net R on the conviction components. Returns R per +1 point
+    with a bootstrap 90% interval. ~1 means 'the weight is about right', ~0 'useless', <0 'harmful'."""
+    if len(closed) < min_n:
+        return None
+    P = pd.DataFrame([_parts(s) for s in closed["parts"]], index=closed.index).fillna(0.0)
+    P = P.loc[:, P.abs().sum() > 0]
+    X, y = P.values, closed["net"].values
+
+    def ridge(Xb, yb):
+        return np.linalg.solve(Xb.T @ Xb + lam * np.eye(Xb.shape[1]), Xb.T @ (yb - yb.mean()))
+
+    base = ridge(X, y)
+    rng = np.random.default_rng(1)
+    bs = np.array([ridge(X[i], y[i]) for i in (rng.integers(0, len(y), len(y)) for _ in range(boots))])
+    lo, hi = np.percentile(bs, [5, 95], axis=0)
+    return pd.DataFrame({"Component": P.columns, "R per point": base.round(4),
+                         "90% low": lo.round(4), "90% high": hi.round(4),
+                         "Significant": (lo > 0) | (hi < 0)}).sort_values("R per point", ascending=False)
+
+
+# ── 6. Historical backtest of YOUR rules (1D + 1W rules only, no look-ahead) ──
+def _ema_np(x, n):
+    x = np.asarray(x, float)
+    out = np.full(len(x), np.nan)
+    if len(x) < n:
+        return out
+    k = 2 / (n + 1)
+    out[n - 1] = x[:n].mean()
+    for i in range(n, len(x)):
+        out[i] = x[i] * k + out[i - 1] * (1 - k)
+    return out
+
+
+def _rule_mask(rule, p, e50, e200):
+    m50, m200, mx = rule
+    ok = np.isfinite(e50) & np.isfinite(e200)
+    if m50 != "Any":
+        ok &= (p > e50) if m50 == "Above" else (p < e50)
+    if m200 != "Any":
+        ok &= (p > e200) if m200 == "Above" else (p < e200)
+    if mx != "Any":
+        ok &= (e50 > e200) if mx == "50>200" else (e50 < e200)
+    return ok
+
+
+def _sim_trade(hi, lo, cl, i0, entry, sl, rr, long, timeout):
+    """Same exit logic as resolve_signal: SL first, 1/3 per TP, time stop marks leftovers."""
+    risk, sign = abs(entry - sl), (1 if long else -1)
+    tps = [entry + sign * risk * r for r in rr]
+    end = min(len(hi), i0 + timeout)
+    if end <= i0 or not risk > 0:
+        return None
+    hit, state = 0, None
+    for j in range(i0, end):
+        if (long and lo[j] <= sl) or ((not long) and hi[j] >= sl):
+            state = "SL"
+            break
+        while hit < 3 and ((long and hi[j] >= tps[hit]) or ((not long) and lo[j] <= tps[hit])):
+            hit += 1
+        if hit == 3:
+            state = "TP3"
+            break
+    if state is None:
+        if end - i0 < timeout:
+            return None                                   # still open
+        rest = max(-1.0, sign * (cl[end - 1] - entry) / risk)
+    else:
+        rest = -1.0 if state == "SL" else 0.0
+    return sum(rr[:hit]) / 3 + (3 - hit) * rest / 3
+
+
+def backtest_symbol(df, rules_d, rules_w, lf, ls, long, atr_mult, rr, timeout, cooldown=10):
+    """Daily candles -> signals when the 1D rule (and the 1W rule, built from completed weeks plus
+    the current day) are all true. Entry = NEXT bar's open. Returns list of dicts."""
+    if df is None or len(df) < ls * 2:
+        return []
+    c, h, l, o = (df[k].values for k in ("close", "high", "low", "open"))
+    ed_f, ed_s = _ema_np(c, lf), _ema_np(c, ls)
+    mask = np.ones(len(df), bool)
+    use = False
+    if rules_d and not all(x == "Any" for x in rules_d):
+        mask &= _rule_mask(rules_d, c, ed_f, ed_s)
+        use = True
+    if rules_w and not all(x == "Any" for x in rules_w):
+        wk = df["t"].dt.to_period("W-SUN")
+        grp = pd.Series(c).groupby(wk.values)
+        wclose = grp.last()                               # last close of each week
+        ew_f, ew_s = _ema_np(wclose.values, lf), _ema_np(wclose.values, ls)
+        pos = pd.Series(range(len(wclose)), index=wclose.index)
+        wi = pos.reindex(wk.values).values.astype(int)    # week index of every day
+        kf, ks = 2 / (lf + 1), 2 / (ls + 1)
+        prev_f = np.where(wi > 0, ew_f[np.maximum(wi - 1, 0)], np.nan)
+        prev_s = np.where(wi > 0, ew_s[np.maximum(wi - 1, 0)], np.nan)
+        cur_f, cur_s = c * kf + prev_f * (1 - kf), c * ks + prev_s * (1 - ks)   # partial week, no look-ahead
+        mask &= _rule_mask(rules_w, c, cur_f, cur_s)
+        use = True
+    if not use:
+        return []
+    a = atr(df).values
+    out, last = [], -10**9
+    for i in range(max(lf, ls), len(df) - 2):
+        if not mask[i] or (i - last) < cooldown or not np.isfinite(a[i]) or a[i] <= 0:
+            continue
+        entry = float(o[i + 1])
+        sl = entry - atr_mult * a[i] if long else entry + atr_mult * a[i]
+        r = _sim_trade(h, l, c, i + 1, entry, sl, rr, long, timeout)
+        if r is None:
+            continue
+        last = i
+        ext = (c[i] - ed_f[i]) / a[i] * (1 if long else -1)
+        out.append({"date": df["t"].iloc[i], "r": r, "ext": ext,
+                    "cost": 0.0, "risk_pct": abs(entry - sl) / entry})
+    return out
+
+
+def run_backtest(symbols, src, rules, lf, ls, long, atr_mult, rr, timeout, cost_bps):
+    rd = dict(rules)
+    rows = []
+
+    def one(s):
+        try:
+            return [dict(t, symbol=s) for t in backtest_symbol(get_candles(src, s, "1d"), rd.get("1d"),
+                                                               rd.get("1w"), lf, ls, long, atr_mult, rr, timeout)]
+        except Exception:
+            return []
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        for r in ex.map(one, symbols):
+            rows += r
+    if not rows:
+        return pd.DataFrame()
+    t = pd.DataFrame(rows)
+    t["net"] = t["r"] - cost_bps / 1e4 / t["risk_pct"]
+    t["ext_bin"] = pd.cut(t["ext"], [-np.inf, 0, 1, 2, 3, np.inf],
+                          labels=["<0 (below EMA)", "0-1 ATR", "1-2 ATR", "2-3 ATR", ">3 ATR (chasing)"])
+    return t
+
+
+def render_backtest(pool_symbols, src, rules, lf, ls, long_bias):
+    st.subheader("🧪 Backtest of your rules (1D + 1W rules only)")
+    st.caption("Intraday rules are ignored. Entry = next daily open, ATR stop, 1/3 out at each TP, time stop. "
+               "Weekly EMAs use completed weeks + today (no look-ahead). Needs >= 2x EMA-slow daily bars: "
+               "crypto feeds return only 300-500 daily bars, so use stocks or a shorter slow EMA there. "
+               "Universe = today's scanned symbols (survivorship bias: results are optimistic).")
+    c1, c2, c3, c4 = st.columns(4)
+    n = c1.slider("Symbols", 10, 300, 80, 10, key="bt_n")
+    mult = c2.number_input("SL (ATR x)", 0.5, 6.0, 1.5, 0.25, key="bt_atr")
+    tmo = c3.slider("Time stop (days)", 5, 120, 30, 5, key="bt_to")
+    cost = c4.number_input("Round-trip cost (bps)", 0.0, 200.0, 15.0, 1.0, key="bt_cost")
+    if st.button("Run backtest", key="bt_run"):
+        with st.spinner("Backtesting..."):
+            st.session_state["bt"] = run_backtest(pool_symbols[:n], src, rules, lf, ls, long_bias,
+                                                  mult, (1.0, 2.0, 3.0), tmo, cost)
+    t = st.session_state.get("bt")
+    if t is None:
+        return
+    if t.empty:
+        st.info("No trades. Check that 1D/1W rules are set and enough history exists.")
+        return
+    st.write(f"**{len(t)} trades, {t['symbol'].nunique()} symbols**")
+    st.dataframe(pd.DataFrame([_stat_row(t)]), hide_index=True, width="content")
+    st.markdown("**By extension from EMA50 (does chasing hurt?)**")
+    st.dataframe(t.groupby("ext_bin", observed=True).apply(_stat_row), width="content")
+    st.markdown("**By year (is the edge stable?)**")
+    st.dataframe(t.groupby(t["date"].dt.year).apply(_stat_row), width="content")
+    st.line_chart(t.sort_values("date")["net"].cumsum().reset_index(drop=True))
+
+
+# ── 7. Telegram: only A/B setups, with the full plan ──
+def telegram_plan(sym, cv, plan, direction):
+    if cv < 65 or not plan:
+        return
+    telegram(f"{direction.upper()} {sym} · grade {grade(cv)} ({cv})\n"
+             f"Entry {fmt(plan['entry'])} · SL {fmt(plan['sl'])}\n"
+             + " · ".join(f"TP{i+1} {fmt(t)}" for i, t in enumerate(plan["tps"])))
+
 # ── Sidebar ─────────────────────────────────────────────────────
 st.sidebar.header("⚙️ Settings")
 market = MARKETS[st.sidebar.radio("Market", list(MARKETS))]

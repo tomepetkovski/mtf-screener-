@@ -1,5 +1,6 @@
 import json
 import os
+import random
 import sqlite3
 import threading
 import time
@@ -1360,13 +1361,13 @@ def extras_json(ex, regime):
         d["Regime"] = regime["state"]
     return json.dumps(d, default=str)
 
-def journal_insert(rec, cooldown_h=24):
+def journal_insert(rec, cooldown_h=24, force=False):
     """Insert one signal unless the same symbol/direction is still OPEN or was logged within cooldown_h."""
     try:
         with _DB_LOCK:
             con = _db()
             try:
-                dup = con.execute(
+                dup = None if force else con.execute(
                     "SELECT 1 FROM signals WHERE market=? AND symbol=? AND direction=? "
                     "AND (outcome='OPEN' OR ts>?) LIMIT 1",
                     (rec["market"], rec["symbol"], rec["direction"], time.time() - cooldown_h * 3600)).fetchone()
@@ -1554,6 +1555,7 @@ def render_journal():
                 "(auto-refresh helps). Outcomes need time: expect to wait for 100+ closed signals before trusting any table below.")
         return
     jdf = jdf.copy()
+    jdf = jdf[~jdf["extras"].astype(str).str.contains('"taken"')]
     jdf["risk"] = (jdf["entry"] - jdf["sl"]).abs()
     jdf["net"] = jdf["r_result"] - cost_bps / 1e4 * jdf["entry"] / jdf["risk"].replace(0, np.nan)
     closed = jdf[jdf["outcome"] != "OPEN"].dropna(subset=["net"])
@@ -2273,8 +2275,6 @@ now = set(match["Symbol"])
 pkey = f"prev_matches_{market}"          # separate state per market -> no false alerts on switch
 prev = st.session_state.get(pkey)
 if alerts and prev is not None:
-    for s in now - prev:
-        telegram(f"ENTRY: {s} - all MTF EMA rules matched")
     for s in prev - now:
         telegram(f"EXIT: {s} - MTF EMA rules no longer matched")
 st.session_state[pkey] = now
@@ -2431,7 +2431,7 @@ with t4:
                     st.metric("Median / 5–95% range",
                               f"{fmt(mc['median'])}", f"{fmt(mc['p5'])} – {fmt(mc['p95'])}", delta_color="off")
                     st.metric("Position size", pos_txt,
-                              f"≈ {qty * entry:,.0f} {ccy} · risk {equity * risk_pct / 100:,.2f}", delta_color="off")
+                              f"≈ {qty * entry:,.0f} {ccy} · risk {qty * risk:,.2f}", delta_color="off")
                     if lv:
                         st.metric("Book imbalance (near price)", f"{lv['imbalance']:+.0%}")
                         sug = lv["long_entry"] if long else lv["short_entry"]
@@ -2497,7 +2497,7 @@ with t4:
                                "status": "MATCH" if sym in now else "WATCH",
                                "parts": json.dumps({k: round(float(v), 2) for k, v in parts.items()}),
                                "extras": json.dumps({**json.loads(extras_json(exs, regime)), "taken": 1})}
-                        if journal_insert(rec, 0):
+                        if journal_insert(rec, 0, force=True):
                             st.success("Logged. Outcome is tracked automatically (time stop = "
                                        f"{j_timeout} bars of {ctf}).")
                         else:
@@ -2531,4 +2531,6 @@ with t5:
 
 # ── Backtest ───────────────────────────────────────────────────
 with t6:
-    render_backtest(list(df["Symbol"]), data_src, rules, lf, ls, long_bias)
+    _syms = list(df["Symbol"])
+    random.Random(7).shuffle(_syms)
+    render_backtest(_syms, data_src, rules, lf, ls, long_bias)

@@ -170,7 +170,7 @@ NQ_HDR = {"User-Agent": "Mozilla/5.0", "Accept": "application/json, text/plain, 
           "Origin": "https://www.nasdaq.com", "Referer": "https://www.nasdaq.com/"}
 YH = ["https://query1.finance.yahoo.com", "https://query2.finance.yahoo.com"]
 YH_TF = {"15m": ("15m", "60d"), "1h": ("60m", "1y"), "4h": ("60m", "1y"),
-         "1d": ("1d", "5y"), "1w": ("1wk", "10y")}
+         "1d": ("1d", "10y"), "1w": ("1wk", "10y")}
 
 def _num(s):
     try:
@@ -1309,7 +1309,7 @@ def volume_nodes(df, bins=40, top=3):
 # ── NEW: Signal journal (SQLite) — log MATCH signals, resolve outcomes, grade-vs-win-rate ──
 _JCOLS = ["ts", "market", "src", "symbol", "tf", "direction", "bar_t", "entry", "sl", "tp1", "tp2", "tp3",
           "rr", "timeout", "conviction", "grade", "status", "parts", "extras"]
-_ALLCOLS = _JCOLS + ["outcome", "r_result", "closed_ts", "bars"]
+_ALLCOLS = _JCOLS + ["outcome", "r_result", "closed_ts", "bars", "mae_r", "mfe_r"]
 _SCHEMA = """CREATE TABLE IF NOT EXISTS signals(
     id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, market TEXT, src TEXT, symbol TEXT, tf TEXT,
     direction TEXT, bar_t INTEGER, entry REAL, sl REAL, tp1 REAL, tp2 REAL, tp3 REAL, rr TEXT,
@@ -1770,7 +1770,10 @@ def trade_plan_v2(df, direction, rr, entry=None, min_atr=1.0, max_atr=3.0):
 def open_heat(risk_pct):
     """% of equity currently at risk if every OPEN journal signal is traded at risk_pct."""
     j = journal_load()
-    return 0.0 if j.empty else float((j["outcome"] == "OPEN").sum()) * risk_pct
+    if j.empty:
+        return 0.0
+    op = j[(j["outcome"] == "OPEN") & j["extras"].astype(str).str.contains('"taken"')]
+    return float(len(op)) * risk_pct
 
 
 def liquidity_cap_qty(daily_df, entry, pct=0.01):
@@ -2150,7 +2153,7 @@ if extras_on:
         with st.spinner("Computing extra signals..."):
             try:
                 extra = enrich_rows(market, data_src, tuple(pool_syms), sig_tf, n_break, vol_mult,
-                                    live, oi_lb, fh_key, long_bias, float(j_atr), j_rr)
+                                    live, oi_lb, fh_key, long_bias, float(j_atr), j_rr, lf)
             except Exception as e:
                 st.warning(f"Extra signals failed: {e}")
     try:
@@ -2217,7 +2220,10 @@ if extras_on:
                    "conviction": cv_[0], "grade": grade(cv_[0]), "status": "MATCH",
                    "parts": json.dumps({k: round(float(v), 2) for k, v in cv_[1].items()}),
                    "extras": extras_json(ex, regime)}
-            n_logged += bool(journal_insert(rec, j_cool))
+            if journal_insert(rec, j_cool):
+                n_logged += 1
+                if alerts:
+                    telegram_plan(s, cv_[0], pl, rec["direction"])
 
 if j_on:
     with _CACHE_LOCK:
@@ -2372,7 +2378,7 @@ with t4:
                 ex_live = {"Breakout": bo, "Crash": cs[0] if cs else None, "OI": exs.get("OI"),
                            "_dz": fl[2] if fl else None, "_imb": lv["imbalance_w"] if lv else None,
                            "_as": exs.get("_as"), "_crowd": exs.get("_crowd"), "_rs": exs.get("_rs"),
-                           "_ed": exs.get("_ed")}
+                           "_ed": exs.get("_ed"), "_ext": ext_atr(cdf, lf, live), "_adx": adx(cdf)}
                 cv, parts = conviction2(ex_live, long, "MATCH" if sym in now else "WATCH", regime, macro_h)
                 blocked = blocked_tps(lv, entry, tps, long)
                 qty = (equity * risk_pct / 100) / risk
@@ -2382,6 +2388,8 @@ with t4:
                 lc = liquidity_cap_qty(dd, entry)
                 if lc and qty > lc:
                     qty = lc
+                    if is_stocks:
+                        qty = float(int(qty))
                     st.caption("Size capped at 1% of average daily $ volume")
                 heat = open_heat(risk_pct)
                 if heat + risk_pct > 6:
@@ -2488,7 +2496,7 @@ with t4:
                                "timeout": int(j_timeout), "conviction": cv, "grade": grade(cv),
                                "status": "MATCH" if sym in now else "WATCH",
                                "parts": json.dumps({k: round(float(v), 2) for k, v in parts.items()}),
-                               "extras": extras_json(exs, regime)}
+                               "extras": json.dumps({**json.loads(extras_json(exs, regime)), "taken": 1})}
                         if journal_insert(rec, 0):
                             st.success("Logged. Outcome is tracked automatically (time stop = "
                                        f"{j_timeout} bars of {ctf}).")
@@ -2520,3 +2528,7 @@ with t4:
 # ── Journal ─────────────────────────────────────────────────────
 with t5:
     render_journal()
+
+# ── Backtest ───────────────────────────────────────────────────
+with t6:
+    render_backtest(list(df["Symbol"]), data_src, rules, lf, ls, long_bias)

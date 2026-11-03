@@ -1372,9 +1372,9 @@ def journal_insert(rec, cooldown_h=24, force=False):
             con = _db()
             try:
                 dup = None if force else con.execute(
-                    "SELECT 1 FROM signals WHERE market=? AND symbol=? AND direction=? "
+                    "SELECT 1 FROM signals WHERE market=? AND symbol=? AND direction=? AND status=? "
                     "AND (outcome='OPEN' OR ts>?) LIMIT 1",
-                    (rec["market"], rec["symbol"], rec["direction"], time.time() - cooldown_h * 3600)).fetchone()
+                    (rec["market"], rec["symbol"], rec["direction"], rec.get("status"), time.time() - cooldown_h * 3600)).fetchone()
                 if dup:
                     return False
                 con.execute(f"INSERT INTO signals({','.join(_JCOLS)}) VALUES({','.join('?' * len(_JCOLS))})",
@@ -1560,6 +1560,9 @@ def render_journal():
         return
     jdf = jdf.copy()
     jdf = jdf[~jdf["extras"].astype(str).str.contains('"taken"')]
+    _sf = st.radio("Signals", ["All", "MATCH only", "WATCH only"], horizontal=True, key="jstat")
+    if _sf != "All" and "status" in jdf.columns:
+        jdf = jdf[jdf["status"] == _sf.split()[0]]
     jdf["risk"] = (jdf["entry"] - jdf["sl"]).abs()
     jdf["net"] = jdf["r_result"] - cost_bps / 1e4 * jdf["entry"] / jdf["risk"].replace(0, np.nan)
     closed = jdf[jdf["outcome"] != "OPEN"].dropna(subset=["net"])
@@ -2088,7 +2091,7 @@ except Exception:
 st.sidebar.subheader("🤖 AI model")
 if ml is None:
     st.sidebar.warning("ml_engine.py missing or failed to import: AI features are off.")
-ai_on = st.sidebar.toggle("AI win-probability forecasts (MATCH rows)", ml is not None, disabled=ml is None,
+ai_on = st.sidebar.toggle("AI win-probability forecasts (MATCH + WATCH)", ml is not None, disabled=ml is None,
                           help="Trained only on MATCH signals. Shown only after it beats the base rate in a "
                                "purged walk-forward test.")
 ai_hist = st.sidebar.toggle("Pre-train on historical MATCH backtest", True,
@@ -2098,9 +2101,13 @@ ai_gb = st.sidebar.toggle("Add gradient boosting to the ensemble", bool(ml is no
 ai_min_n = st.sidebar.number_input("Min closed MATCH signals to open the gate", 30, 1000, 80, 10)
 ai_every = st.sidebar.slider("Auto-retrain after N newly closed MATCH signals (0 = manual)", 0, 100, 10)
 ai_cost = st.sidebar.number_input("Round-trip cost for training labels (bps)", 0.0, 200.0, 15.0, 1.0)
-ai_min_p = st.sidebar.slider("Hide MATCH with AI P(win) below (%, 0 = off)", 0, 80, 0, 5)
-ai_sort = st.sidebar.toggle("Sort MATCH by AI P(win)", False)
-ai_cfg = {"min_n": int(ai_min_n), "use_gb": bool(ai_gb), "cost_bps": float(ai_cost)}
+ai_min_p = st.sidebar.slider("Hide signals with AI P(win) below (%, 0 = off)", 0, 80, 0, 5)
+ai_sort = st.sidebar.toggle("Sort MATCH/WATCH by AI P(win)", False)
+ai_watch = st.sidebar.toggle("Log + train on WATCH signals too", True,
+                             help="WATCH = all timeframes but one matched. More samples, faster learning. "
+                                  "Off = MATCH only (older WATCH rows in the journal are then ignored by the AI).")
+ai_cfg = {"min_n": int(ai_min_n), "use_gb": bool(ai_gb), "cost_bps": float(ai_cost),
+          "include_watch": bool(ai_watch)}
 
 st.sidebar.subheader("EMA criteria presets")
 preset_name = st.sidebar.selectbox(
@@ -2216,8 +2223,8 @@ if extras_on:
             conv_map[s] = conviction2(ex, long_bias, st_map.get(s), regime, macro_h)
         df["Conviction"] = df["Symbol"].map(lambda s: conv_map[s][0] if s in conv_map else None)
 
-    if AI_ON and ai_model is not None:                     # the AI scores MATCH rows only (what it was trained on)
-        _m_syms = set(df.loc[df["Status"] == "MATCH", "Symbol"])
+    if AI_ON and ai_model is not None:                     # the AI scores MATCH and WATCH rows
+        _m_syms = set(df.loc[df["Status"].isin(["MATCH", "WATCH"]), "Symbol"])
         for s_, ex_ in extra.items():
             cv0 = conv_map.get(s_)
             if s_ in _m_syms and cv0 and ex_.get("_feat"):
@@ -2232,6 +2239,7 @@ if extras_on:
             lambda s: 100 * ai_pred[s]["p"] if s in ai_pred else None), errors="coerce").round(1)
         df["AI EV (R)"] = pd.to_numeric(df["Symbol"].map(
             lambda s: ai_pred[s]["ev"] if s in ai_pred else None), errors="coerce").round(2)
+        df["AI call"] = df["Symbol"].map(lambda s: ai_pred[s]["call"] if s in ai_pred else None)
 
     as_map = {s: v.get("_as") for s, v in extra.items()}
     ed_map = {s: v.get("_ed") for s, v in extra.items()}
@@ -2271,8 +2279,10 @@ if extras_on:
         match = match.sort_values("AI P(win)", ascending=False, na_position="last")
 
     # ── Journal: log every displayed MATCH once, then resolve old signals (throttled) ──
-    if j_on and not match.empty:
-        for s in match["Symbol"]:
+    _jlog = (pd.concat([match.assign(_st="MATCH"), watch.assign(_st="WATCH")])
+             if ai_watch else match.assign(_st="MATCH"))
+    if j_on and not _jlog.empty:
+        for s, _st in zip(_jlog["Symbol"], _jlog["_st"]):
             ex = extra.get(s) or {}
             pl, cv_ = ex.get("_plan"), conv_map.get(s)
             if not pl or not cv_:
@@ -2281,13 +2291,13 @@ if extras_on:
                    "direction": "Long" if long_bias else "Short", "bar_t": pl["bar_t"],
                    "entry": pl["entry"], "sl": pl["sl"], "tp1": pl["tps"][0], "tp2": pl["tps"][1],
                    "tp3": pl["tps"][2], "rr": ",".join(f"{x:g}" for x in pl["rr"]), "timeout": int(j_timeout),
-                   "conviction": cv_[0], "grade": grade(cv_[0]), "status": "MATCH",
+                   "conviction": cv_[0], "grade": grade(cv_[0]), "status": _st,
                    "parts": json.dumps({k: round(float(v), 2) for k, v in cv_[1].items()}),
                    "extras": extras_json(ex, regime),
                    "feat": json.dumps(ex.get("_feat")) if ex.get("_feat") else None}
             if journal_insert(rec, j_cool):
                 n_logged += 1
-                if alerts:
+                if alerts and _st == "MATCH":
                     telegram_plan(s, cv_[0], pl, rec["direction"])
 
 if j_on:
@@ -2504,14 +2514,14 @@ with t4:
                               help=" · ".join(f"{k} {v:+.0f}" for k, v in parts.items()))
                     _ap = ai_pred.get(sym) if AI_ON else None
                     if _ap:
-                        st.metric("🤖 AI P(win)", f"{_ap['p'] * 100:.0f}%",
+                        st.metric(f"🤖 AI P(win) · {_ap['call']}", f"{_ap['p'] * 100:.0f}%",
                                   f"EV {_ap['ev']:+.2f}R" + ("" if _ap["agree"] is None
                                                           else f" · models agree {_ap['agree'] * 100:.0f}%"),
                                   delta_color="off",
                                   help="Calibrated, walk-forward validated chance that this MATCH ends net "
                                        "positive (scanner signal timeframe). Shrunk toward the base rate.")
                     elif AI_ON:
-                        st.caption("🤖 No AI forecast: it scores MATCH rows only, and only while its gate is open.")
+                        st.caption("🤖 No AI forecast: it needs a scanner MATCH/WATCH row with extra signals, and its gate must be open.")
                     if fillp is not None:
                         st.metric("Limit fill chance", f"{fillp * 100:.0f}%",
                                   f"EV per signal {fillp * ev_net:+.2f}R", delta_color="off")

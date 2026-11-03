@@ -15,6 +15,10 @@ import requests
 import streamlit as st
 from concurrent.futures import ThreadPoolExecutor
 from streamlit_autorefresh import st_autorefresh
+try:
+    import ml_engine as ml          # AI layer (optional: the app runs without it)
+except Exception:
+    ml = None
 
 st.set_page_config(page_title="MTF EMA Screener Pro", page_icon="📈", layout="wide")
 
@@ -1309,12 +1313,12 @@ def volume_nodes(df, bins=40, top=3):
 
 # ── NEW: Signal journal (SQLite) — log MATCH signals, resolve outcomes, grade-vs-win-rate ──
 _JCOLS = ["ts", "market", "src", "symbol", "tf", "direction", "bar_t", "entry", "sl", "tp1", "tp2", "tp3",
-          "rr", "timeout", "conviction", "grade", "status", "parts", "extras"]
+          "rr", "timeout", "conviction", "grade", "status", "parts", "extras", "feat"]
 _ALLCOLS = _JCOLS + ["outcome", "r_result", "closed_ts", "bars", "mae_r", "mfe_r"]
 _SCHEMA = """CREATE TABLE IF NOT EXISTS signals(
     id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, market TEXT, src TEXT, symbol TEXT, tf TEXT,
     direction TEXT, bar_t INTEGER, entry REAL, sl REAL, tp1 REAL, tp2 REAL, tp3 REAL, rr TEXT,
-    timeout INTEGER, conviction INTEGER, grade TEXT, status TEXT, parts TEXT, extras TEXT,
+    timeout INTEGER, conviction INTEGER, grade TEXT, status TEXT, parts TEXT, extras TEXT, feat TEXT,
     outcome TEXT DEFAULT 'OPEN', r_result REAL, closed_ts REAL, bars INTEGER DEFAULT 0)"""
 
 def _db():
@@ -1614,7 +1618,7 @@ def render_journal():
             st.markdown("**Suggested weights**")
             st.dataframe(fw, hide_index=True)
 
-    show = jdf.drop(columns=["parts", "extras", "risk"]).copy()
+    show = jdf.drop(columns=["parts", "extras", "risk", "feat"], errors="ignore").copy()
     show["ts"] = pd.to_datetime(show["ts"], unit="s")
     show["closed_ts"] = pd.to_datetime(show["closed_ts"], unit="s")
     show["bar_t"] = pd.to_datetime(show["bar_t"], unit="ms")
@@ -1625,7 +1629,7 @@ def render_journal():
 
 # ── Enrichment for MATCH/WATCH rows ─────────────────────────────
 @st.cache_data(ttl=300, show_spinner=False)
-def enrich_rows(market, src, syms, tf, n_break, vol_mult, live, oi_lb, fh_key, long_bias, j_atr, j_rr, lf_):
+def enrich_rows(market, src, syms, tf, n_break, vol_mult, live, oi_lb, fh_key, long_bias, j_atr, j_rr, lf_, ls_=200):
     stocks = market == "stocks"
     store = _store()
     bench = get_closes(store, src, "SPY" if stocks else "BTCUSDT", "1d")
@@ -1647,6 +1651,9 @@ def enrich_rows(market, src, syms, tf, n_break, vol_mult, live, oi_lb, fh_key, l
             out["Flow"] = flow_text(fl)
             out["_dz"] = fl[2] if fl else None
             out["_plan"] = journal_plan(cdf, long_bias, live, j_atr, j_rr)
+            if ml is not None:
+                out["_feat"] = ml.live_features(cdf, long_bias, lf_, ls_,
+                                                {"stocks": stocks, "tf": tf, "sl_atr": float(j_atr)})
             if not stocks:
                 out["OI"] = oi_signal(s, tf, cdf, oi_lb, live)
                 try:
@@ -1792,6 +1799,8 @@ def _migrate(con):
     for c in ("mae_r", "mfe_r"):
         if c not in have:
             con.execute(f"ALTER TABLE signals ADD COLUMN {c} REAL")
+    if "feat" not in have:
+        con.execute("ALTER TABLE signals ADD COLUMN feat TEXT")
 
 
 def excursions(row, df, bars):
@@ -1887,7 +1896,7 @@ def _sim_trade(hi, lo, cl, i0, entry, sl, rr, long, timeout):
     return sum(rr[:hit]) / 3 + (3 - hit) * rest / 3
 
 
-def backtest_symbol(df, rules_d, rules_w, lf, ls, long, atr_mult, rr, timeout, cooldown=10):
+def backtest_symbol(df, rules_d, rules_w, lf, ls, long, atr_mult, rr, timeout, cooldown=10, meta=None):
     """Daily candles -> signals when the 1D rule (and the 1W rule, built from completed weeks plus
     the current day) are all true. Entry = NEXT bar's open. Returns list of dicts."""
     if df is None or len(df) < ls * 2:
@@ -1915,6 +1924,7 @@ def backtest_symbol(df, rules_d, rules_w, lf, ls, long, atr_mult, rr, timeout, c
     if not use:
         return []
     a = atr(df).values
+    ff = ml.raw_feature_frame(df, lf, ls) if (ml is not None and meta is not None) else None
     out, last = [], -10**9
     for i in range(max(lf, ls), len(df) - 2):
         if not mask[i] or (i - last) < cooldown or not np.isfinite(a[i]) or a[i] <= 0:
@@ -1927,18 +1937,21 @@ def backtest_symbol(df, rules_d, rules_w, lf, ls, long, atr_mult, rr, timeout, c
         last = i
         ext = (c[i] - ed_f[i]) / a[i] * (1 if long else -1)
         out.append({"date": df["t"].iloc[i], "r": r, "ext": ext,
-                    "cost": 0.0, "risk_pct": abs(entry - sl) / entry})
+                    "cost": 0.0, "risk_pct": abs(entry - sl) / entry,
+                    "t_end": df["t"].iloc[min(i + 1 + timeout, len(df) - 1)],
+                    "feat": ml.signed_features(ff.iloc[i], long, meta) if ff is not None else None})
     return out
 
 
 def run_backtest(symbols, src, rules, lf, ls, long, atr_mult, rr, timeout, cost_bps):
     rd = dict(rules)
+    meta = {"stocks": src == "yahoo", "tf": "1d", "sl_atr": float(atr_mult)}
     rows = []
 
     def one(s):
         try:
             return [dict(t, symbol=s) for t in backtest_symbol(get_candles(src, s, "1d"), rd.get("1d"),
-                                                               rd.get("1w"), lf, ls, long, atr_mult, rr, timeout)]
+                                                               rd.get("1w"), lf, ls, long, atr_mult, rr, timeout, meta=meta)]
         except Exception:
             return []
 
@@ -1982,6 +1995,14 @@ def render_backtest(pool_symbols, src, rules, lf, ls, long_bias):
     st.markdown("**By year (is the edge stable?)**")
     st.dataframe(t.groupby(t["date"].dt.year).apply(_stat_row), width="content")
     st.line_chart(t.sort_values("date")["net"].cumsum().reset_index(drop=True))
+    if ml is not None and "feat" in t.columns and t["feat"].notna().any():
+        st.markdown("**🤖 AI pre-training**")
+        st.caption("Saves these MATCH events (price features + net R) as a down-weighted pre-training set. "
+                   "Use after changing rules or direction: the set always reflects the rules of this run.")
+        if st.button("🤖 Use these trades to pre-train the AI model", key="bt_to_ai"):
+            n_h = ml.save_hist(t, {"rules": str(rules), "src": src, "long": bool(long_bias), "timeout": int(tmo),
+                                   "sl_atr": float(mult), "cost_bps": float(cost)})
+            st.success(f"Saved {n_h} historical MATCH rows. Open the 🤖 AI model tab and press Retrain.")
 
 
 # ── 7. Telegram: only A/B setups, with the full plan ──
@@ -2064,6 +2085,23 @@ except Exception:
     j_rr = (1.0, 2.0, 3.0)
     st.sidebar.warning("Journal TPs must be three positive numbers: using 1,2,3")
 
+st.sidebar.subheader("🤖 AI model")
+if ml is None:
+    st.sidebar.warning("ml_engine.py missing or failed to import: AI features are off.")
+ai_on = st.sidebar.toggle("AI win-probability forecasts (MATCH rows)", ml is not None, disabled=ml is None,
+                          help="Trained only on MATCH signals. Shown only after it beats the base rate in a "
+                               "purged walk-forward test.")
+ai_hist = st.sidebar.toggle("Pre-train on historical MATCH backtest", True,
+                            help="Uses the set saved from the Backtest tab (down-weighted, price features only).")
+ai_gb = st.sidebar.toggle("Add gradient boosting to the ensemble", bool(ml is not None and ml.HAVE_SK),
+                          disabled=not (ml is not None and ml.HAVE_SK), help="Needs scikit-learn.")
+ai_min_n = st.sidebar.number_input("Min closed MATCH signals to open the gate", 30, 1000, 80, 10)
+ai_every = st.sidebar.slider("Auto-retrain after N newly closed MATCH signals (0 = manual)", 0, 100, 10)
+ai_cost = st.sidebar.number_input("Round-trip cost for training labels (bps)", 0.0, 200.0, 15.0, 1.0)
+ai_min_p = st.sidebar.slider("Hide MATCH with AI P(win) below (%, 0 = off)", 0, 80, 0, 5)
+ai_sort = st.sidebar.toggle("Sort MATCH by AI P(win)", False)
+ai_cfg = {"min_n": int(ai_min_n), "use_gb": bool(ai_gb), "cost_bps": float(ai_cost)}
+
 st.sidebar.subheader("EMA criteria presets")
 preset_name = st.sidebar.selectbox(
     "Preset",
@@ -2142,6 +2180,8 @@ match = df[df["Status"] == "MATCH"]
 watch = df[df["Status"] == "WATCH"]
 
 # ── Macro context ───────────────────────────────────────────────
+AI_ON = ml is not None and ai_on
+ai_model = ml.load_model() if AI_ON else None
 macro_events = parse_macro(macro_txt)
 macro_next = next_macro(macro_events)
 macro_h = macro_next[0] if macro_next else None
@@ -2149,13 +2189,14 @@ long_bias = rules_direction(rules)
 
 # ── Extra signals (MATCH/WATCH rows only) + filters ─────────────
 extra, as_map, regime, hidden, conv_map, n_logged = {}, {}, None, 0, {}, 0
+ai_pred = {}
 if extras_on:
     pool_syms = (list(match["Symbol"]) + list(watch["Symbol"]))[:ENRICH_MAX]
     if pool_syms:
         with st.spinner("Computing extra signals..."):
             try:
                 extra = enrich_rows(market, data_src, tuple(pool_syms), sig_tf, n_break, vol_mult,
-                                    live, oi_lb, fh_key, long_bias, float(j_atr), j_rr, lf)
+                                    live, oi_lb, fh_key, long_bias, float(j_atr), j_rr, lf, ls)
             except Exception as e:
                 st.warning(f"Extra signals failed: {e}")
     try:
@@ -2174,6 +2215,23 @@ if extras_on:
         for s, ex in extra.items():
             conv_map[s] = conviction2(ex, long_bias, st_map.get(s), regime, macro_h)
         df["Conviction"] = df["Symbol"].map(lambda s: conv_map[s][0] if s in conv_map else None)
+
+    if AI_ON and ai_model is not None:                     # the AI scores MATCH rows only (what it was trained on)
+        _m_syms = set(df.loc[df["Status"] == "MATCH", "Symbol"])
+        for s_, ex_ in extra.items():
+            cv0 = conv_map.get(s_)
+            if s_ in _m_syms and cv0 and ex_.get("_feat"):
+                try:
+                    pr_ = ml.predict_one(ai_model, ex_["_feat"], cv0[1])
+                except Exception:
+                    pr_ = None
+                if pr_:
+                    ai_pred[s_] = pr_
+    if ai_pred:
+        df["AI P(win)"] = pd.to_numeric(df["Symbol"].map(
+            lambda s: 100 * ai_pred[s]["p"] if s in ai_pred else None), errors="coerce").round(1)
+        df["AI EV (R)"] = pd.to_numeric(df["Symbol"].map(
+            lambda s: ai_pred[s]["ev"] if s in ai_pred else None), errors="coerce").round(2)
 
     as_map = {s: v.get("_as") for s, v in extra.items()}
     ed_map = {s: v.get("_ed") for s, v in extra.items()}
@@ -2197,6 +2255,8 @@ if extras_on:
             f = f[~f["Symbol"].map(lambda s: ed_map.get(s) is not None and ed_map[s] <= hide_earn).astype(bool)]
         if hide_crowd:
             f = f[~f["Symbol"].map(_crowded).astype(bool)]
+        if AI_ON and ai_min_p and ai_pred and "AI P(win)" in f.columns:
+            f = f[~(pd.to_numeric(f["AI P(win)"], errors="coerce") < ai_min_p)]      # NaN (no forecast) is kept
         return f
 
     match = df[df["Status"] == "MATCH"]
@@ -2207,6 +2267,8 @@ if extras_on:
     if "Conviction" in df.columns:
         match = match.sort_values("Conviction", ascending=False, na_position="last")
         watch = watch.sort_values("Conviction", ascending=False, na_position="last")
+    if AI_ON and ai_sort and "AI P(win)" in df.columns:
+        match = match.sort_values("AI P(win)", ascending=False, na_position="last")
 
     # ── Journal: log every displayed MATCH once, then resolve old signals (throttled) ──
     if j_on and not match.empty:
@@ -2221,7 +2283,8 @@ if extras_on:
                    "tp3": pl["tps"][2], "rr": ",".join(f"{x:g}" for x in pl["rr"]), "timeout": int(j_timeout),
                    "conviction": cv_[0], "grade": grade(cv_[0]), "status": "MATCH",
                    "parts": json.dumps({k: round(float(v), 2) for k, v in cv_[1].items()}),
-                   "extras": extras_json(ex, regime)}
+                   "extras": extras_json(ex, regime),
+                   "feat": json.dumps(ex.get("_feat")) if ex.get("_feat") else None}
             if journal_insert(rec, j_cool):
                 n_logged += 1
                 if alerts:
@@ -2235,6 +2298,19 @@ if j_on:
             _SHARED[("__jr_last__",)] = (time.time(), True)
         try:
             journal_resolve()
+        except Exception:
+            pass
+
+if AI_ON and ai_every:                                    # automatic retraining on newly closed MATCH signals
+    with _CACHE_LOCK:
+        _ai_last = _SHARED.get(("__ai_last__",), (0, None))[0]
+    if time.time() - _ai_last > 300:
+        with _CACHE_LOCK:
+            _SHARED[("__ai_last__",)] = (time.time(), True)
+        try:
+            _jd = journal_load()
+            if ml.needs_retrain(ai_model, _jd, ai_every, ai_cfg):
+                ml.train_and_save(_jd, ml.load_hist() if ai_hist else None, ai_cfg)
         except Exception:
             pass
 
@@ -2285,12 +2361,16 @@ if "Crash" in df.columns:
         cfg["Crash"] = st.column_config.ProgressColumn("Crash risk", min_value=0, max_value=100, format="%d")
 if "Conviction" in df.columns:
         cfg["Conviction"] = st.column_config.ProgressColumn("Conviction", min_value=0, max_value=100, format="%d")
+if "AI P(win)" in df.columns:
+    cfg["AI P(win)"] = st.column_config.ProgressColumn("AI P(win)", min_value=0, max_value=100, format="%.0f%%")
+    cfg["AI EV (R)"] = st.column_config.NumberColumn("AI EV (R)", format="%+.2f")
 for _c in ("Breakout", "Flow", "OI", "Book", "Funding", "L/S", "Crowding", "Earnings", "Analyst",
                "RS 1w %", "RS 4w %"):
         if _c in df.columns and _c not in cfg:
             cfg[_c] = st.column_config.TextColumn(_c)
 
-t1, t2, t3, t4, t5, t6 = st.tabs(["✅ MATCH", "👀 WATCH", "All", "🎯 Trade planner", "📒 Journal", "🧪 Backtest"])
+t1, t2, t3, t4, t5, t6, t7 = st.tabs(["✅ MATCH", "👀 WATCH", "All", "🎯 Trade planner", "📒 Journal", "🧪 Backtest",
+                                       "🤖 AI model"])
 for key, tab, data in (("match", t1, match), ("watch", t2, watch), ("all", t3, df)):
     with tab:
         if data.empty:
@@ -2422,6 +2502,16 @@ with t4:
                     st.metric("Net EV after costs", f"{ev_net:+.2f}R", f"costs {cost_r:.2f}R", delta_color="off")
                     st.metric("Setup grade", f"{grade(cv)} · {cv}/100",
                               help=" · ".join(f"{k} {v:+.0f}" for k, v in parts.items()))
+                    _ap = ai_pred.get(sym) if AI_ON else None
+                    if _ap:
+                        st.metric("🤖 AI P(win)", f"{_ap['p'] * 100:.0f}%",
+                                  f"EV {_ap['ev']:+.2f}R" + ("" if _ap["agree"] is None
+                                                          else f" · models agree {_ap['agree'] * 100:.0f}%"),
+                                  delta_color="off",
+                                  help="Calibrated, walk-forward validated chance that this MATCH ends net "
+                                       "positive (scanner signal timeframe). Shrunk toward the base rate.")
+                    elif AI_ON:
+                        st.caption("🤖 No AI forecast: it scores MATCH rows only, and only while its gate is open.")
                     if fillp is not None:
                         st.metric("Limit fill chance", f"{fillp * 100:.0f}%",
                                   f"EV per signal {fillp * ev_net:+.2f}R", delta_color="off")
@@ -2485,6 +2575,11 @@ with t4:
                         st.warning(w_)
                     if not warn:
                         st.success("No event, crowding or regime warning right now.")
+                    _ap2 = ai_pred.get(sym) if AI_ON else None
+                    if _ap2:
+                        st.markdown("**🤖 AI drivers** (linear part, + raises P(win))")
+                        st.dataframe(pd.DataFrame(_ap2["drivers"], columns=["Driver", "Effect (logit)"]).round(2),
+                                     hide_index=True, width="content")
 
                 # one-click journal entry for the exact plan shown above
                 if entry_mode == "Market":
@@ -2528,6 +2623,13 @@ with t4:
 # ── Journal ─────────────────────────────────────────────────────
 with t5:
     render_journal()
+
+# ── AI model ────────────────────────────────────────────────────
+with t7:
+    if ml is None:
+        st.error("ml_engine.py not found next to this app.")
+    else:
+        ml.render_tab(st, journal_load(), ai_cfg, ai_hist)
 
 # ── Backtest ───────────────────────────────────────────────────
 with t6:

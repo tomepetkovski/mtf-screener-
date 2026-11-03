@@ -33,15 +33,16 @@ import numpy as np
 import pandas as pd
 
 try:
-    from sklearn.ensemble import GradientBoostingClassifier
+    from sklearn.ensemble import GradientBoostingClassifier, ExtraTreesClassifier
     HAVE_SK = True
 except Exception:                                   # scikit-learn is optional
     GradientBoostingClassifier = None
+    ExtraTreesClassifier = None
     HAVE_SK = False
 
 MODEL_PATH = os.environ.get("AI_MODEL_PATH", "ai_model.pkl")
 HIST_PATH = os.environ.get("AI_HIST_PATH", "ai_hist.pkl")
-MODEL_VERSION = 3
+MODEL_VERSION = 4
 _TRAIN_LOCK = threading.Lock()
 _MODEL_CACHE = {}
 
@@ -61,7 +62,9 @@ DEFAULT_CFG = {
 }
 
 PRICE_COLS = ["ext", "rsi", "mom5", "mom20", "slope", "dist_slow", "dz",
-              "adx", "atr_pct", "bbw_pct", "vol_z", "pullback", "room"]
+              "adx", "atr_pct", "bbw_pct", "vol_z", "pullback", "room",
+              "ret1", "ret5", "ret20", "ret_z", "range_atr", "body_atr",
+              "close_loc", "wick_reject", "ema_gap"]
 META_COLS = ["is_long", "is_stocks", "tf_log", "sl_atr"]
 PART_KEYS = ["MTF", "Flow", "Book", "OI", "Break", "Crash", "Regime", "Analyst", "Crowd",
              "RelStr", "Earnings", "Event", "Extend", "Trend"]      # conviction components (AI is never one)
@@ -73,7 +76,12 @@ NICE = {
     "mom20": "20-bar momentum (ATR)", "slope": "Fast-EMA slope", "dist_slow": "Distance to slow EMA",
     "dz": "Volume delta z (with trade)", "adx": "Trend strength (ADX)", "atr_pct": "Volatility (log ATR %)",
     "bbw_pct": "Squeeze percentile", "vol_z": "Volume z", "pullback": "Pullback depth (ATR)",
-    "room": "Room to 20-bar extreme (ATR)", "is_long": "Long (vs short)", "is_stocks": "Stock (vs crypto)",
+    "room": "Room to 20-bar extreme (ATR)", "ret1": "1-bar return (ATR, with trade)",
+    "ret5": "5-bar return (ATR, with trade)", "ret20": "20-bar return (ATR, with trade)",
+    "ret_z": "Return anomaly Z-score (with trade)", "range_atr": "Bar range (ATR)",
+    "body_atr": "Candle body (ATR, with trade)", "close_loc": "Close location (with trade)",
+    "wick_reject": "Directional rejection wick (ATR)", "ema_gap": "Fast/slow EMA gap (ATR, with trade)",
+    "is_long": "Long (vs short)", "is_stocks": "Stock (vs crypto)",
     "tf_log": "Timeframe", "sl_atr": "Stop size (ATR)", "is_live": "Live (vs backtest) row",
 }
 for _k in PART_KEYS:
@@ -128,6 +136,23 @@ def raw_feature_frame(df, lf=50, ls=200):
     f["atr_pct"] = np.log((a / c * 100).clip(lower=1e-6))
     f["bbw_pct"] = bbw_pct
     f["vol_z"] = (lv - m50) / s50.replace(0, np.nan)
+    # Scale-free additions; reference return statistics exclude the current bar.
+    ret = c.pct_change()
+    ret_mu = ret.rolling(50, min_periods=25).mean().shift(1)
+    ret_sd = ret.rolling(50, min_periods=25).std().shift(1)
+    op = df["open"].astype(float)
+    f["ret1"] = c.diff() / a
+    f["ret5"] = (c - c.shift(5)) / a
+    f["ret20"] = (c - c.shift(20)) / a
+    f["ret_z"] = (ret - ret_mu) / ret_sd.replace(0, np.nan)
+    f["range_atr"] = (h - l) / a
+    f["body_atr"] = (c - op) / a
+    f["close_loc"] = clv
+    lower_wick = (np.minimum(op, c) - l).clip(lower=0)
+    upper_wick = (h - np.maximum(op, c)).clip(lower=0)
+    f["lower_wick_atr"] = lower_wick / a
+    f["upper_wick_atr"] = upper_wick / a
+    f["ema_gap"] = (ef - es) / a
     f["dd60"] = (h.rolling(60).max() - c) / a
     f["ru60"] = (c - l.rolling(60).min()) / a
     f["room_up"] = (h.rolling(20).max().shift(1) - c) / a
@@ -157,6 +182,13 @@ def signed_features(row, long, meta=None):
         "bbw_pct": _cl(g("bbw_pct"), 0, 1), "vol_z": _cl(g("vol_z"), -5, 5),
         "pullback": _cl(g("dd60") if long else g("ru60"), 0, 15),
         "room": _cl(g("room_up") if long else g("room_dn"), -10, 10),
+        "ret1": sgn("ret1", -8, 8), "ret5": sgn("ret5", -8, 8),
+        "ret20": sgn("ret20", -12, 12), "ret_z": sgn("ret_z", -6, 6),
+        "range_atr": _cl(g("range_atr"), 0, 10),
+        "body_atr": sgn("body_atr", -8, 8),
+        "close_loc": sgn("close_loc", -1, 1),
+        "wick_reject": _cl(g("lower_wick_atr") if long else g("upper_wick_atr"), 0, 8),
+        "ema_gap": sgn("ema_gap", -12, 12),
         "is_long": 1.0 if long else 0.0,
         "is_stocks": 1.0 if meta.get("stocks") else 0.0,
         "tf_log": float(np.log2(TF_MIN.get(meta.get("tf", "1d"), 1440) / 15)),
@@ -353,26 +385,46 @@ def _fit_models(tr, cols, cfg):
     mu, sd = _scaler(X, w, cols)
     Xs = np.clip((X - mu) / sd, -5, 5)
     beta = _fit_logit(Xs, y, w, cfg["l2"])
-    gb = None
+    gb, et = None, None
     if cfg["use_gb"] and HAVE_SK and len(tr) >= 60:
         try:
-            gb = GradientBoostingClassifier(n_estimators=100, learning_rate=0.05, max_depth=2, subsample=0.7,
-                                            min_samples_leaf=max(10, int(0.02 * len(tr))), max_features=0.7,
-                                            random_state=7)
+            gb = GradientBoostingClassifier(
+                n_estimators=100, learning_rate=0.04, max_depth=2, subsample=0.75,
+                min_samples_leaf=max(8, int(0.03 * len(tr))), max_features=0.8,
+                random_state=7
+            )
             gb.fit(Xs, y, sample_weight=w)
         except Exception:
             gb = None
-    return {"cols": cols, "imp": imp, "mu": mu, "sd": sd, "beta": beta, "gb": gb}
+        # Diverse tree family; conservative leaves reduce overfit on noisy labels.
+        try:
+            et = ExtraTreesClassifier(
+                n_estimators=160, min_samples_leaf=max(5, int(0.04 * len(tr))),
+                max_features=0.75, class_weight="balanced", random_state=17, n_jobs=1
+            )
+            et.fit(Xs, y, sample_weight=w)
+        except Exception:
+            et = None
+    return {"cols": cols, "imp": imp, "mu": mu, "sd": sd, "beta": beta, "gb": gb, "et": et}
 
 
 def _predict_raw(m, df):
     X = _matrix(df, m["cols"], m["imp"])
     Xs = np.clip((X - m["mu"]) / m["sd"], -5, 5)
     p_lr = _sig(m["beta"][0] + Xs @ m["beta"][1:])
-    if m["gb"] is not None:
-        p_gb = m["gb"].predict_proba(Xs)[:, 1]
-        return 0.5 * (p_lr + p_gb), p_lr, p_gb, Xs
-    return p_lr, p_lr, None, Xs
+    preds, weights, tree_preds = [p_lr], [0.30], []
+    if m.get("gb") is not None:
+        pg = m["gb"].predict_proba(Xs)[:, 1]
+        preds.append(pg); weights.append(0.35); tree_preds.append(pg)
+    if m.get("et") is not None:
+        pe = m["et"].predict_proba(Xs)[:, 1]
+        preds.append(pe); weights.append(0.35); tree_preds.append(pe)
+    weights = np.asarray(weights, dtype=float)
+    weights /= weights.sum()
+    p = sum(w * pred for w, pred in zip(weights, preds))
+    # Preserve the existing return contract: third item is the non-linear consensus.
+    p_tree = np.mean(tree_preds, axis=0) if tree_preds else None
+    return p, p_lr, p_tree, Xs
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -482,20 +534,47 @@ def train(jdf, hist=None, cfg=None):
     prior, a_cal, b_cal = float(D.loc[D["src"] == ("live" if scope == "live" else "hist"), "y"].mean()), 0.0, 1.0
     th, rel, by_status = [], [], []
     if len(oof) >= 20 and oof["y"].nunique() == 2:
-        y, p, net = oof["y"].values, oof["p"].values, oof["net"].values
-        a_cal, b_cal = _platt(p, y)
-        pc = _sig(a_cal + b_cal * _logit(p))
+        # Deploy calibration is fit on all OOF predictions; validation metrics use
+        # expanding chronological calibration to avoid scoring an in-sample calibrator.
+        y_all, p_all = oof["y"].values.astype(int), oof["p"].values.astype(float)
+        net_all = oof["net"].values.astype(float)
+        a_cal, b_cal = _platt(p_all, y_all)
+        pc_eval = p_all.copy()
+        eval_mask = np.zeros(len(oof), dtype=bool)
+        calibration_mode = "raw-small-sample"
+        if len(oof) >= 45:
+            start_cal = max(20, len(oof) // 3)
+            edges = np.linspace(start_cal, len(oof), min(5, len(oof) - start_cal + 1), dtype=int)
+            for j in range(len(edges) - 1):
+                lo_i, hi_i = int(edges[j]), int(edges[j + 1])
+                if hi_i <= lo_i or len(np.unique(y_all[:lo_i])) < 2:
+                    continue
+                try:
+                    aa, bb = _platt(p_all[:lo_i], y_all[:lo_i])
+                    pc_eval[lo_i:hi_i] = _sig(aa + bb * _logit(p_all[lo_i:hi_i]))
+                    eval_mask[lo_i:hi_i] = True
+                except Exception:
+                    continue
+            calibration_mode = "expanding-crossfit"
+        if not eval_mask.any():
+            eval_mask[:] = True
+            pc_eval = p_all.copy()
+        y, pc, net = y_all[eval_mask], pc_eval[eval_mask], net_all[eval_mask]
+        oof_eval = oof.iloc[np.where(eval_mask)[0]].reset_index(drop=True)
         lo, hi = _boot_auc(y, pc)
-        brier, brier_base = float(np.mean((pc - y) ** 2)), float(np.mean((oof["base"].values - y) ** 2))
+        brier, brier_base = float(np.mean((pc - y) ** 2)), float(np.mean((oof_eval["base"].values - y) ** 2))
         ll = float(-np.mean(y * np.log(np.clip(pc, 1e-6, 1)) + (1 - y) * np.log(np.clip(1 - pc, 1e-6, 1))))
         metrics = {"auc": auc_score(y, pc), "auc_lo": lo, "auc_hi": hi, "brier": brier, "brier_base": brier_base,
                    "skill": 1 - brier / brier_base if brier_base > 0 else float("nan"), "logloss": ll,
-                   "n_oof": len(oof), "win_all": float(y.mean())}
+                   "n_oof": len(y), "n_oof_total": len(oof), "calibration_mode": calibration_mode,
+                   "win_all": float(y.mean())}
         th, rel = _tables(pc, y, net)
-        by_status = _by_status(oof, pc)
+        by_status = _by_status(oof_eval, pc)
         n_eval = int((D["src"] == ("live" if scope == "live" else "hist")).sum())
         if n_eval < cfg["min_n"]:
             reasons.append(f"{n_eval} closed {scope} MATCH signals < {cfg['min_n']} required")
+        if len(y) < 20:
+            reasons.append(f"only {len(y)} out-of-sample evaluation predictions after calibration checks; need ≥ 20")
         if not (np.isfinite(lo) and lo > 0.5):
             reasons.append(f"AUC {metrics['auc']:.3f} (90% low {lo:.3f}) is not reliably above 0.5")
         if not (np.isfinite(metrics["skill"]) and metrics["skill"] > 0):
@@ -517,17 +596,18 @@ def train(jdf, hist=None, cfg=None):
     status = ("ACTIVE_LIVE" if scope == "live" else "ACTIVE_HIST") if ok else "LEARNING"
 
     imp_tab = []
-    gbi = full["gb"].feature_importances_ if full["gb"] is not None else None
+    _tree_imps = [m.feature_importances_ for m in (full.get("gb"), full.get("et")) if m is not None]
+    gbi = np.mean(_tree_imps, axis=0) if _tree_imps else None
     for j, c in enumerate(cols):
         imp_tab.append({"Feature": NICE.get(c, c), "LR coef (std)": round(float(full["beta"][j + 1]), 3),
-                        "GB importance": round(float(gbi[j]), 3) if gbi is not None else None})
+                        "Tree importance": round(float(gbi[j]), 3) if gbi is not None else None})
     return {"version": MODEL_VERSION, "status": status, "trained_ts": time.time(), "cfg": cfg, "scope": scope,
             "model": full, "cols": cols, "calib": (a_cal, b_cal), "prior": prior, "shrink": float(shrink),
             "avg_win": float(wins.mean()) if len(wins) else 1.5,
             "avg_loss": float(max(0.2, -loss.mean())) if len(loss) else 0.9,
             "n_live": n_live, "n_hist": n_hist, "n_eval": n_eval, "metrics": metrics,
             "thresholds": th, "reliability": rel, "by_status": by_status, "importance": imp_tab,
-            "gate": {"ok": ok, "reasons": reasons}, "has_gb": full["gb"] is not None}
+            "gate": {"ok": ok, "reasons": reasons}, "has_gb": full["gb"] is not None, "has_et": full.get("et") is not None}
 
 
 def save_model(pkg, path=MODEL_PATH):
@@ -691,7 +771,8 @@ def render_tab(st, jdf, cfg, use_hist):
     b2.markdown(f"**{BADGE.get(pkg['status'], pkg['status'])}**  ·  trained "
                 f"{time.strftime('%Y-%m-%d %H:%M', time.gmtime(pkg['trained_ts']))} UTC  ·  "
                 f"{pkg['n_live']} live + {pkg['n_hist']} historical rows"
-                + ("  ·  ensemble: logistic + gradient boosting" if pkg.get("has_gb") else "  ·  logistic only"))
+                + ("  ·  ensemble: logistic + gradient boosting + ExtraTrees" if pkg.get("has_gb") and pkg.get("has_et") else
+                   "  ·  ensemble: logistic + available tree model" if (pkg.get("has_gb") or pkg.get("has_et")) else "  ·  logistic only"))
     for r in pkg["gate"]["reasons"]:
         st.warning("Gate closed: " + r)
     m = pkg.get("metrics") or {}
@@ -712,7 +793,10 @@ def render_tab(st, jdf, cfg, use_hist):
         st.dataframe(pd.DataFrame(pkg["thresholds"]), hide_index=True, width="content")
         st.markdown("**Reliability** (predicted vs actual win rate in 5 buckets; they should track each other)")
         st.dataframe(pd.DataFrame(pkg["reliability"]), hide_index=True, width="content")
-    st.markdown("**What the model uses** (standardised logistic coefficient; + = raises P(win))")
+    if m.get("calibration_mode"):
+        st.caption(f"Validation calibration: {m['calibration_mode']} · {m.get('n_oof', 0)} evaluated OOF predictions "
+                   f"from {m.get('n_oof_total', m.get('n_oof', 0))} total walk-forward predictions.")
+    st.markdown("**What the model uses** (standardised logistic coefficient; + = raises P(win); tree importance is averaged across available tree models)")
     st.dataframe(pd.DataFrame(pkg["importance"]).sort_values("LR coef (std)", key=abs, ascending=False),
                  hide_index=True, width="content")
     lc = live_check(pkg, jdf)

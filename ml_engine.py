@@ -1,9 +1,11 @@
 """
 ml_engine.py — AI layer for "MTF EMA Screener Pro"
 ===================================================
-Predicts P(win) and expected R of a MATCH setup, trained ONLY on MATCH signals:
+Predicts P(win), expected R and a TAKE / NEUTRAL / SKIP call for MATCH and WATCH setups, trained on
+the rule-based signals only (MATCH, and optionally WATCH; manual plans and everything else are excluded):
 
-  * live  : closed MATCH rows of your signal journal (status == 'MATCH', manual "taken" plans excluded)
+  * live  : closed MATCH (+ WATCH) rows of your signal journal (manual "taken" plans excluded);
+            the conviction component 'MTF' (20 = MATCH, 8 = WATCH) tells the model which kind it is
   * hist  : optional pre-training set = historical MATCH events produced by the Backtest tab
             (same rules, same exit logic, price features only, down-weighted)
 
@@ -39,7 +41,7 @@ except Exception:                                   # scikit-learn is optional
 
 MODEL_PATH = os.environ.get("AI_MODEL_PATH", "ai_model.pkl")
 HIST_PATH = os.environ.get("AI_HIST_PATH", "ai_hist.pkl")
-MODEL_VERSION = 2
+MODEL_VERSION = 3
 _TRAIN_LOCK = threading.Lock()
 _MODEL_CACHE = {}
 
@@ -54,6 +56,8 @@ DEFAULT_CFG = {
     "cost_bps": 15.0,       # round-trip cost used to turn R into net R for the labels
     "shrink_k": 150.0,      # shrinkage: p = prior + n/(n+k) * (p_model - prior)
     "hist_cap": 0.5,        # max shrink weight when only historically validated
+    "include_watch": True,  # train on WATCH signals too (False = MATCH only)
+    "take_ev": 0.10,        # AI call = TAKE needs net EV >= this many R (and P(win) above the base rate)
 }
 
 PRICE_COLS = ["ext", "rsi", "mom5", "mom20", "slope", "dist_slow", "dz",
@@ -184,15 +188,16 @@ def _loadj(s):
         return {}
 
 
-def journal_frame(jdf, cost_bps=15.0):
-    """Closed MATCH signals of the journal (manual 'taken' plans and WATCH rows are excluded)."""
+def journal_frame(jdf, cost_bps=15.0, include_watch=True):
+    """Closed MATCH (+ optionally WATCH) signals of the journal; manual 'taken' plans are excluded."""
     if jdf is None or len(jdf) == 0:
         return pd.DataFrame()
     j = jdf.copy()
     for c in ("feat", "parts", "extras", "status", "outcome", "closed_ts"):
         if c not in j.columns:
             j[c] = None
-    m = (j["status"] == "MATCH") & (j["outcome"].astype(str) != "OPEN") & j["r_result"].notna()
+    ok_st = ["MATCH", "WATCH"] if include_watch else ["MATCH"]
+    m = j["status"].isin(ok_st) & (j["outcome"].astype(str) != "OPEN") & j["r_result"].notna()
     m &= ~j["extras"].astype(str).str.contains('"taken"')
     j = j[m]
     if j.empty:
@@ -207,7 +212,7 @@ def journal_frame(jdf, cost_bps=15.0):
                 r["p_" + k] = v
         rows.append(r)
     X = pd.DataFrame(rows, index=j.index)
-    head = pd.DataFrame({"src": "live", "t_open": j["ts"].astype(float),
+    head = pd.DataFrame({"src": "live", "status": j["status"].astype(str), "t_open": j["ts"].astype(float),
                          "t_close": pd.to_numeric(j["closed_ts"], errors="coerce").fillna(j["ts"]).astype(float),
                          "net": net, "y": (net > 0).astype(int)})
     out = pd.concat([head, X], axis=1).dropna(subset=["net"])
@@ -253,7 +258,7 @@ def save_hist(t, meta, path=HIST_PATH):
 
 
 def assemble(jdf, hist, cfg):
-    live = journal_frame(jdf, cfg["cost_bps"])
+    live = journal_frame(jdf, cfg["cost_bps"], cfg["include_watch"])
     parts = [live] if len(live) else []
     if hist is not None and len(hist.get("df", [])):
         parts.append(hist["df"])
@@ -264,6 +269,8 @@ def assemble(jdf, hist, cfg):
         if c not in D.columns:
             D[c] = np.nan
     D["is_live"] = (D["src"] == "live").astype(float)
+    D["status"] = D["status"].fillna("MATCH") if "status" in D.columns else "MATCH"
+    D.loc[D["src"] == "hist", "p_MTF"] = 20.0                   # backtest events are MATCH by construction
     for c in ALL_COLS:
         D[c] = pd.to_numeric(D[c], errors="coerce")
     return D.sort_values("t_open").reset_index(drop=True)
@@ -411,7 +418,8 @@ def walk_forward(D, cols, cfg):
             continue
         p, p_lr, p_gb, _ = _predict_raw(m, te)
         out.append(pd.DataFrame({"p": p, "base": float(tr["y"].mean()), "y": te["y"].values,
-                                 "net": te["net"].values, "t": te["t_open"].values}))
+                                 "net": te["net"].values, "t": te["t_open"].values,
+                                 "status": te["status"].values}))
     return (pd.concat(out, ignore_index=True) if out else pd.DataFrame()), scope
 
 
@@ -440,6 +448,19 @@ def _tables(oof_p, y, net):
     return th, rel
 
 
+def _by_status(oof, pc):
+    rows = []
+    for st_ in ("MATCH", "WATCH"):
+        m = (oof["status"] == st_).values
+        if m.sum() >= 5:
+            y = oof["y"].values[m]
+            rows.append({"Signal": st_, "n": int(m.sum()), "Win %": round(100 * float(y.mean()), 1),
+                         "Avg R (net)": round(float(oof["net"].values[m].mean()), 3),
+                         "Avg AI P(win) %": round(100 * float(pc[m].mean()), 1),
+                         "AUC": round(auc_score(y, pc[m]), 3) if (m.sum() >= 20 and 0 < y.sum() < len(y)) else None})
+    return rows
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 5. Train / save / load / predict
 # ══════════════════════════════════════════════════════════════════════════════
@@ -459,7 +480,7 @@ def train(jdf, hist=None, cfg=None):
     reasons, ok = [], False
     metrics = {}
     prior, a_cal, b_cal = float(D.loc[D["src"] == ("live" if scope == "live" else "hist"), "y"].mean()), 0.0, 1.0
-    th, rel = [], []
+    th, rel, by_status = [], [], []
     if len(oof) >= 20 and oof["y"].nunique() == 2:
         y, p, net = oof["y"].values, oof["p"].values, oof["net"].values
         a_cal, b_cal = _platt(p, y)
@@ -471,6 +492,7 @@ def train(jdf, hist=None, cfg=None):
                    "skill": 1 - brier / brier_base if brier_base > 0 else float("nan"), "logloss": ll,
                    "n_oof": len(oof), "win_all": float(y.mean())}
         th, rel = _tables(pc, y, net)
+        by_status = _by_status(oof, pc)
         n_eval = int((D["src"] == ("live" if scope == "live" else "hist")).sum())
         if n_eval < cfg["min_n"]:
             reasons.append(f"{n_eval} closed {scope} MATCH signals < {cfg['min_n']} required")
@@ -504,7 +526,7 @@ def train(jdf, hist=None, cfg=None):
             "avg_win": float(wins.mean()) if len(wins) else 1.5,
             "avg_loss": float(max(0.2, -loss.mean())) if len(loss) else 0.9,
             "n_live": n_live, "n_hist": n_hist, "n_eval": n_eval, "metrics": metrics,
-            "thresholds": th, "reliability": rel, "importance": imp_tab,
+            "thresholds": th, "reliability": rel, "by_status": by_status, "importance": imp_tab,
             "gate": {"ok": ok, "reasons": reasons}, "has_gb": full["gb"] is not None}
 
 
@@ -550,7 +572,7 @@ def train_and_save(jdf, hist=None, cfg=None):
 
 def needs_retrain(pkg, jdf, every_n, cfg=None):
     cfg = {**DEFAULT_CFG, **(cfg or {})}
-    L = journal_frame(jdf, cfg["cost_bps"])
+    L = journal_frame(jdf, cfg["cost_bps"], cfg["include_watch"])
     if not pkg or pkg.get("status") == "NO_DATA":
         return len(L) >= cfg["min_live_eval"] or hist_available()
     if not every_n:
@@ -590,14 +612,21 @@ def predict_one(pkg, feat, parts):
     contrib = beta * Xs[0]
     top = np.argsort(-np.abs(contrib))[:4]
     drivers = [(NICE.get(pkg["model"]["cols"][j], pkg["model"]["cols"][j]), float(contrib[j])) for j in top]
-    return {"p": p, "ev": float(ev), "agree": agree, "drivers": drivers, "status": pkg["status"]}
+    cfg = pkg.get("cfg", DEFAULT_CFG)
+    if ev >= cfg.get("take_ev", 0.10) and p >= pkg["prior"] + 0.02 and (agree is None or agree >= 0.4):
+        call = "✅ TAKE"
+    elif ev < 0:
+        call = "⛔ SKIP"
+    else:
+        call = "➖ NEUTRAL"
+    return {"p": p, "ev": float(ev), "agree": agree, "drivers": drivers, "status": pkg["status"], "call": call}
 
 
 def live_check(pkg, jdf):
     """Out-of-sample check on MATCH signals that closed AFTER the model was trained."""
     if not pkg or "model" not in pkg:
         return None
-    L = journal_frame(jdf, pkg["cfg"]["cost_bps"])
+    L = journal_frame(jdf, pkg["cfg"]["cost_bps"], pkg["cfg"].get("include_watch", True))
     if L.empty:
         return None
     L = L[(L["t_close"] > pkg["trained_ts"]) & L["has_feat"]]
@@ -625,15 +654,17 @@ BADGE = {"ACTIVE_LIVE": "🟢 ACTIVE · validated on your live MATCH signals",
 
 def render_tab(st, jdf, cfg, use_hist):
     cfg = {**DEFAULT_CFG, **(cfg or {})}
-    st.subheader("🤖 AI model: win probability for MATCH setups")
-    st.caption("Trained only on MATCH signals (journal + optional historical backtest of your own rules). "
+    st.subheader("🤖 AI model: win probability for MATCH / WATCH setups")
+    st.caption("Trained only on rule-based signals (MATCH + WATCH from the journal, plus an optional historical backtest of your own rules). "
                "Walk-forward validated, calibrated, shrunk toward the base rate and switched on only when it "
                "beats the base rate out-of-sample. It is a probability estimate, not a guarantee or financial advice.")
     pkg = load_model()
-    L = journal_frame(jdf, cfg["cost_bps"])
+    L = journal_frame(jdf, cfg["cost_bps"], cfg["include_watch"])
     hi = hist_info()
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Closed live MATCH", len(L))
+    c1.metric("Closed live signals", len(L),
+              f"{int((L['status'] == 'MATCH').sum())} MATCH · {int((L['status'] == 'WATCH').sum())} WATCH" if len(L) else None,
+              delta_color="off")
     c2.metric("Historical MATCH rows", hi["n"] if hi else 0)
     c3.metric("scikit-learn", "yes" if HAVE_SK else "no (logistic only)")
     c4.metric("Model", "trained" if pkg else "none")
@@ -645,7 +676,7 @@ def render_tab(st, jdf, cfg, use_hist):
                 "10y of daily bars) and press 'Use these trades to pre-train the AI model'.")
 
     b1, b2 = st.columns([1, 3])
-    if b1.button("🔁 Retrain now (MATCH only)"):
+    if b1.button("🔁 Retrain now"):
         with st.spinner("Walk-forward validation + final fit..."):
             new = train_and_save(jdf, load_hist() if use_hist else None, cfg)
         if new is None:
@@ -674,6 +705,9 @@ def render_tab(st, jdf, cfg, use_hist):
             k4.metric("Win % in AI top third", f"{th[1]['Win %']:.0f}%", f"avg {th[1]['Avg R (net)']:+.2f}R", delta_color="off")
         k5.metric("Shrink weight", f"{pkg['shrink'] * 100:.0f}%", help="Share of the model deviation from the base rate "
                                                                         "that is passed on to forecasts.")
+        if pkg.get("by_status"):
+            st.markdown("**By signal type** (out-of-fold: is WATCH worth trading, and does the AI separate it?)")
+            st.dataframe(pd.DataFrame(pkg["by_status"]), hide_index=True, width="content")
         st.markdown("**Precision by AI rank** (out-of-fold: does a higher AI probability really win more?)")
         st.dataframe(pd.DataFrame(pkg["thresholds"]), hide_index=True, width="content")
         st.markdown("**Reliability** (predicted vs actual win rate in 5 buckets; they should track each other)")
@@ -694,8 +728,11 @@ def render_tab(st, jdf, cfg, use_hist):
         st.caption(f"Live check needs ≥ 5 new closed signals after training (have {lc['n']}).")
     with st.expander("How to read this / limits"):
         st.markdown(
-            "- **MATCH-only training** means the model answers one question: *given that the rules fired, "
-            "which signals tend to work?* It cannot find setups your rules miss.\n"
+            "- **Rule-signal training** means the model answers one question: *given that the rules fired "
+            "(MATCH, or WATCH = all but one timeframe), which signals tend to work?* It cannot find setups your "
+            "rules miss. Turn off WATCH training in the sidebar to go back to MATCH only.\n"
+            "- **AI call**: TAKE needs net EV ≥ 0.10R, a P(win) above the base rate and the two models roughly "
+            "agreeing; SKIP means negative expected R; everything else is NEUTRAL. It is a filter, not a command.\n"
             "- A forecast is shown only if the model beats the base rate in a **purged walk-forward test**. "
             "Below ~100 closed signals expect LEARNING most of the time: that is the honest answer.\n"
             "- Markets change. Weights decay with a 2-year half-life and the live check watches for drift.\n"

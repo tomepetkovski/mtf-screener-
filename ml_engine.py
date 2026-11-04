@@ -33,16 +33,17 @@ import numpy as np
 import pandas as pd
 
 try:
-    from sklearn.ensemble import GradientBoostingClassifier, ExtraTreesClassifier
+    from sklearn.ensemble import GradientBoostingClassifier, ExtraTreesClassifier, ExtraTreesRegressor
     HAVE_SK = True
 except Exception:                                   # scikit-learn is optional
     GradientBoostingClassifier = None
     ExtraTreesClassifier = None
+    ExtraTreesRegressor = None
     HAVE_SK = False
 
 MODEL_PATH = os.environ.get("AI_MODEL_PATH", "ai_model.pkl")
 HIST_PATH = os.environ.get("AI_HIST_PATH", "ai_hist.pkl")
-MODEL_VERSION = 4
+MODEL_VERSION = 5
 _TRAIN_LOCK = threading.Lock()
 _MODEL_CACHE = {}
 
@@ -59,6 +60,10 @@ DEFAULT_CFG = {
     "hist_cap": 0.5,        # max shrink weight when only historically validated
     "include_watch": True,  # train on WATCH signals too (False = MATCH only)
     "take_ev": 0.10,        # AI call = TAKE needs net EV >= this many R (and P(win) above the base rate)
+    "use_sentiment": "auto",  # "auto" = keep market-sentiment features only if they improve OOF AUC; True / False = force
+    "sent_margin": 0.01,    # auto mode: sentiment must beat the no-sentiment OOF AUC by this much
+    "use_reg": True,        # expected-R regression head (blended into EV only if it validates out-of-fold)
+    "spread_k": 3.0,        # extra shrink = spread_k * std of member probabilities (capped at 50 %)
 }
 
 PRICE_COLS = ["ext", "rsi", "mom5", "mom20", "slope", "dist_slow", "dz",
@@ -66,9 +71,10 @@ PRICE_COLS = ["ext", "rsi", "mom5", "mom20", "slope", "dist_slow", "dz",
               "ret1", "ret5", "ret20", "ret_z", "range_atr", "body_atr",
               "close_loc", "wick_reject", "ema_gap"]
 META_COLS = ["is_long", "is_stocks", "tf_log", "sl_atr"]
+SENT_COLS = ["s_level", "s_chg", "s_align", "s_extreme", "s_vixp"]
 PART_KEYS = ["MTF", "Flow", "Book", "OI", "Break", "Crash", "Regime", "Analyst", "Crowd",
              "RelStr", "Earnings", "Event", "Extend", "Trend"]      # conviction components (AI is never one)
-ALL_COLS = PRICE_COLS + META_COLS + ["p_" + k for k in PART_KEYS] + ["is_live"]
+ALL_COLS = PRICE_COLS + META_COLS + SENT_COLS + ["p_" + k for k in PART_KEYS] + ["is_live"]
 TF_MIN = {"15m": 15, "1h": 60, "4h": 240, "1d": 1440, "1w": 10080}
 
 NICE = {
@@ -83,6 +89,10 @@ NICE = {
     "wick_reject": "Directional rejection wick (ATR)", "ema_gap": "Fast/slow EMA gap (ATR, with trade)",
     "is_long": "Long (vs short)", "is_stocks": "Stock (vs crypto)",
     "tf_log": "Timeframe", "sl_atr": "Stop size (ATR)", "is_live": "Live (vs backtest) row",
+    "s_level": "Market sentiment (crypto Fear&Greed / stocks VIX-fear; + = greed)",
+    "s_chg": "Sentiment change (7d crypto / 5d stocks)",
+    "s_align": "Sentiment with the trade (+ = trading with the crowd mood)",
+    "s_extreme": "Sentiment extreme (|level|)", "s_vixp": "VIX percentile (1y)",
 }
 for _k in PART_KEYS:
     NICE["p_" + _k] = f"Conviction: {_k}"
@@ -210,6 +220,155 @@ def live_features(df, long, lf=50, ls=200, meta=None):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 1b. Market sentiment (history-backed, so it can be trained AND back-filled onto old rows)
+# ══════════════════════════════════════════════════════════════════════════════
+# Crypto : alternative.me Fear & Greed index (daily, since 2018, free, no key)
+# Stocks : Yahoo ^VIX (daily) -> 1-year percentile -> "fear" level (high VIX = fear = negative)
+# Both are market-wide (not per symbol) and are looked up at (signal date - 1 day): no look-ahead.
+# Per-symbol news headlines are deliberately NOT a model feature: there is no history to train on.
+SENT_PATH = os.environ.get("AI_SENT_PATH", "sentiment_cache.pkl")
+SENT_TTL = 6 * 3600
+_SENT = {"t": 0.0, "fail": 0.0, "tabs": None}
+_SENT_LOCK = threading.Lock()
+
+
+def _http_json(url, timeout=8):
+    import requests
+    r = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
+    r.raise_for_status()
+    return r.json()
+
+
+def _fetch_fg():
+    j = _http_json("https://api.alternative.me/fng/?limit=0&format=json")
+    s = pd.Series({pd.Timestamp(int(d["timestamp"]), unit="s").normalize(): float(d["value"]) for d in j["data"]})
+    return s.sort_index()
+
+
+def _fetch_vix():
+    j = _http_json("https://query1.finance.yahoo.com/v8/finance/chart/%5EVIX?range=10y&interval=1d")
+    r = j["chart"]["result"][0]
+    s = pd.Series(r["indicators"]["quote"][0]["close"], index=pd.to_datetime(r["timestamp"], unit="s").normalize())
+    s = s.dropna()
+    return s[~s.index.duplicated(keep="last")].sort_index()
+
+
+def _pct_last(w):
+    return float((w[:-1] <= w[-1]).mean())
+
+
+def build_sent_tables(fg, vix):
+    """fg: Series 0..100 indexed by date; vix: Series of VIX closes. Returns {'crypto': df, 'stocks': df}
+    with columns level (-1 fear .. +1 greed), chg, vixp, on a daily calendar (forward-filled)."""
+    out = {}
+    vp = None
+    if vix is not None and len(vix) > 80:
+        vp = vix.rolling(252, min_periods=60).apply(_pct_last, raw=True)
+        lv = -(2 * vp - 1)
+        d = pd.DataFrame({"level": lv, "chg": lv - lv.shift(5), "vixp": vp}).dropna(subset=["level"])
+        idx = pd.date_range(d.index.min(), max(d.index.max(), pd.Timestamp.utcnow().tz_localize(None).normalize()))
+        out["stocks"] = d.reindex(idx).ffill(limit=5)
+    if fg is not None and len(fg) > 30:
+        lv = (fg - 50.0) / 50.0
+        d = pd.DataFrame({"level": lv, "chg": lv - lv.shift(7)})
+        idx = pd.date_range(d.index.min(), max(d.index.max(), pd.Timestamp.utcnow().tz_localize(None).normalize()))
+        d = d.reindex(idx).ffill(limit=5)
+        if vp is not None:
+            d["vixp"] = vp.reindex(idx).ffill(limit=5)
+        else:
+            d["vixp"] = np.nan
+        out["crypto"] = d
+    return out or None
+
+
+def set_sent_tables(tabs):
+    """Inject tables (tests / offline use)."""
+    _SENT.update({"t": time.time(), "tabs": tabs})
+
+
+def sent_tables(force=False):
+    """Cached tables; network only when stale; a failed fetch is not retried for 15 min (never blocks the UI)."""
+    now = time.time()
+    if _SENT["tabs"] is not None and not force and now - _SENT["t"] < SENT_TTL:
+        return _SENT["tabs"]
+    if now - _SENT["fail"] < 900 and _SENT["tabs"] is not None:
+        return _SENT["tabs"]
+    with _SENT_LOCK:
+        if _SENT["tabs"] is None:                                   # first use: try the disk cache
+            try:
+                with open(SENT_PATH, "rb") as fh:
+                    c = pickle.load(fh)
+                _SENT.update({"t": c["t"], "tabs": c["tabs"]})
+            except Exception:
+                pass
+            if _SENT["tabs"] is not None and time.time() - _SENT["t"] < SENT_TTL and not force:
+                return _SENT["tabs"]
+        if time.time() - _SENT["fail"] < 900 and not force:
+            return _SENT["tabs"]
+        fg = vix = None
+        try:
+            fg = _fetch_fg()
+        except Exception:
+            pass
+        try:
+            vix = _fetch_vix()
+        except Exception:
+            pass
+        tabs = build_sent_tables(fg, vix) if (fg is not None or vix is not None) else None
+        if tabs:
+            old = _SENT["tabs"] or {}
+            for k, v in old.items():                                # keep a market whose fetch failed this time
+                tabs.setdefault(k, v)
+            _SENT.update({"t": time.time(), "tabs": tabs, "fail": 0.0})
+            try:
+                with open(SENT_PATH + ".tmp", "wb") as fh:
+                    pickle.dump({"t": _SENT["t"], "tabs": tabs}, fh)
+                os.replace(SENT_PATH + ".tmp", SENT_PATH)
+            except Exception:
+                pass
+        else:
+            _SENT["fail"] = time.time()
+        return _SENT["tabs"]
+
+
+def sentiment_features(ts, stocks, long, tabs=None):
+    """ts: scalar or array of unix seconds; stocks: bool or array; long: bool or array (is_long).
+    Returns DataFrame[SENT_COLS] (NaN where history is missing). Lookup date = day(ts) - 1."""
+    ts = np.atleast_1d(np.asarray(ts, dtype=float))
+    n = len(ts)
+    stocks = np.broadcast_to(np.asarray(stocks, dtype=float), (n,)) > 0.5
+    sg = np.where(np.broadcast_to(np.asarray(long, dtype=float), (n,)) > 0.5, 1.0, -1.0)
+    tabs = tabs if tabs is not None else sent_tables()
+    out = pd.DataFrame(np.nan, index=range(n), columns=SENT_COLS)
+    if not tabs:
+        return out
+    dates = pd.to_datetime(ts, unit="s").normalize() - pd.Timedelta(days=1)
+    for key, m in (("stocks", stocks), ("crypto", ~stocks)):
+        t = tabs.get(key)
+        if t is None or not m.any():
+            continue
+        v = t.reindex(dates[m], method="ffill")
+        out.loc[m, "s_level"] = v["level"].values
+        out.loc[m, "s_chg"] = v["chg"].values
+        out.loc[m, "s_vixp"] = v["vixp"].values
+    out["s_align"] = sg * out["s_level"]
+    out["s_extreme"] = out["s_level"].abs()
+    return out
+
+
+def _add_sentiment(D):
+    """Fill sentiment columns for every row from its open time (only where still missing)."""
+    try:
+        sf = sentiment_features(D["t_open"].values, D["is_stocks"].fillna(0).values, D["is_long"].fillna(1).values)
+    except Exception:
+        return D
+    for c in SENT_COLS:
+        D[c] = pd.to_numeric(D[c], errors="coerce") if c in D.columns else np.nan
+        D[c] = D[c].fillna(pd.Series(sf[c].values, index=D.index))
+    return D
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 2. Datasets (MATCH only)
 # ══════════════════════════════════════════════════════════════════════════════
 def _loadj(s):
@@ -305,7 +464,10 @@ def assemble(jdf, hist, cfg):
     D.loc[D["src"] == "hist", "p_MTF"] = 20.0                   # backtest events are MATCH by construction
     for c in ALL_COLS:
         D[c] = pd.to_numeric(D[c], errors="coerce")
-    return D.sort_values("t_open").reset_index(drop=True)
+    D = D.sort_values("t_open").reset_index(drop=True)
+    if cfg.get("use_sentiment", "auto") is not False:
+        D = _add_sentiment(D)
+    return D
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -338,6 +500,16 @@ def _fit_logit(X, y, w, l2, iters=60):
         if np.abs(step).max() < 1e-7:
             break
     return beta
+
+
+def _fit_ridge(X, y, w, l2):
+    n, d = X.shape
+    Xb = np.hstack([np.ones((n, 1)), X])
+    w = w / max(w.mean(), 1e-12)
+    pen = l2 * np.eye(d + 1)
+    pen[0, 0] = 0.0
+    A = Xb.T @ (Xb * w[:, None]) + pen + 1e-6 * np.eye(d + 1)
+    return np.linalg.solve(A, Xb.T @ (w * y))
 
 
 def _weights(df, cfg, t_ref):
@@ -405,26 +577,61 @@ def _fit_models(tr, cols, cfg):
             et.fit(Xs, y, sample_weight=w)
         except Exception:
             et = None
-    return {"cols": cols, "imp": imp, "mu": mu, "sd": sd, "beta": beta, "gb": gb, "et": et}
+    reg_b, reg_et = None, None
+    if cfg.get("use_reg", True) and len(tr) >= 40:                  # expected-R head (target winsorised)
+        yr = np.clip(tr["net"].values.astype(float), -2.0, 4.0)
+        try:
+            reg_b = _fit_ridge(Xs, yr, w, cfg["l2"] * 2.0)
+        except Exception:
+            reg_b = None
+        if cfg["use_gb"] and HAVE_SK and len(tr) >= 60:
+            try:
+                reg_et = ExtraTreesRegressor(n_estimators=120, min_samples_leaf=max(8, int(0.05 * len(tr))),
+                                             max_features=0.75, random_state=23, n_jobs=1)
+                reg_et.fit(Xs, yr, sample_weight=w)
+            except Exception:
+                reg_et = None
+    return {"cols": cols, "imp": imp, "mu": mu, "sd": sd, "beta": beta, "gb": gb, "et": et,
+            "reg_b": reg_b, "reg_et": reg_et}
+
+
+def _predict_members(m, df):
+    """All ensemble members on a feature frame: p_lr / p_gb / p_et (None if absent), ev_hat (None if no
+    regression head), Xs (standardised matrix)."""
+    X = _matrix(df, m["cols"], m["imp"])
+    Xs = np.clip((X - m["mu"]) / m["sd"], -5, 5)
+    out = {"Xs": Xs, "p_lr": _sig(m["beta"][0] + Xs @ m["beta"][1:]), "p_gb": None, "p_et": None, "ev_hat": None}
+    if m.get("gb") is not None:
+        out["p_gb"] = m["gb"].predict_proba(Xs)[:, 1]
+    if m.get("et") is not None:
+        out["p_et"] = m["et"].predict_proba(Xs)[:, 1]
+    evs = []
+    if m.get("reg_b") is not None:
+        evs.append(m["reg_b"][0] + Xs @ m["reg_b"][1:])
+    if m.get("reg_et") is not None:
+        evs.append(m["reg_et"].predict(Xs))
+    if evs:
+        out["ev_hat"] = np.mean(evs, axis=0)
+    return out
 
 
 def _predict_raw(m, df):
-    X = _matrix(df, m["cols"], m["imp"])
-    Xs = np.clip((X - m["mu"]) / m["sd"], -5, 5)
-    p_lr = _sig(m["beta"][0] + Xs @ m["beta"][1:])
-    preds, weights, tree_preds = [p_lr], [0.30], []
-    if m.get("gb") is not None:
-        pg = m["gb"].predict_proba(Xs)[:, 1]
-        preds.append(pg); weights.append(0.35); tree_preds.append(pg)
-    if m.get("et") is not None:
-        pe = m["et"].predict_proba(Xs)[:, 1]
-        preds.append(pe); weights.append(0.35); tree_preds.append(pe)
+    mb = _predict_members(m, df)
+    preds, weights, tree_preds = [mb["p_lr"]], [0.30], []
+    for k in ("p_gb", "p_et"):
+        if mb[k] is not None:
+            preds.append(mb[k]); weights.append(0.35); tree_preds.append(mb[k])
     weights = np.asarray(weights, dtype=float)
     weights /= weights.sum()
     p = sum(w * pred for w, pred in zip(weights, preds))
-    # Preserve the existing return contract: third item is the non-linear consensus.
-    p_tree = np.mean(tree_preds, axis=0) if tree_preds else None
-    return p, p_lr, p_tree, Xs
+    p_tree = np.mean(tree_preds, axis=0) if tree_preds else None      # non-linear consensus
+    return p, mb["p_lr"], p_tree, mb["Xs"]
+
+
+def _spread(mb):
+    """Std of the member probabilities per row (0 if fewer than two members): model disagreement."""
+    ps = [mb[k] for k in ("p_lr", "p_gb", "p_et") if mb[k] is not None]
+    return np.std(ps, axis=0) if len(ps) >= 2 else np.zeros(len(mb["p_lr"]))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -469,9 +676,14 @@ def walk_forward(D, cols, cfg):
         if m is None:
             continue
         p, p_lr, p_gb, _ = _predict_raw(m, te)
+        mb = _predict_members(m, te)
+        nan = np.full(len(te), np.nan)
         out.append(pd.DataFrame({"p": p, "base": float(tr["y"].mean()), "y": te["y"].values,
                                  "net": te["net"].values, "t": te["t_open"].values,
-                                 "status": te["status"].values}))
+                                 "status": te["status"].values,
+                                 "m_lr": mb["p_lr"], "m_gb": mb["p_gb"] if mb["p_gb"] is not None else nan,
+                                 "m_et": mb["p_et"] if mb["p_et"] is not None else nan,
+                                 "ev_hat": mb["ev_hat"] if mb["ev_hat"] is not None else nan}))
     return (pd.concat(out, ignore_index=True) if out else pd.DataFrame()), scope
 
 
@@ -516,6 +728,74 @@ def _by_status(oof, pc):
 # ══════════════════════════════════════════════════════════════════════════════
 # 5. Train / save / load / predict
 # ══════════════════════════════════════════════════════════════════════════════
+def _oof_auc(oof):
+    try:
+        y = oof["y"].values.astype(int)
+        return auc_score(y, oof["p"].values.astype(float)) if len(oof) >= 20 and 0 < y.sum() < len(y) else float("nan")
+    except Exception:
+        return float("nan")
+
+
+def _sentiment_decision(D, cols, cfg, oof):
+    """Sentiment is only worth keeping if it measurably helps out-of-fold. auto = run the ablation."""
+    mode = cfg.get("use_sentiment", "auto")
+    sc = [c for c in cols if c in SENT_COLS]
+    cov = float(D["s_level"].notna().mean()) if "s_level" in D.columns and len(D) else 0.0
+    info = {"mode": mode, "kept": bool(sc), "coverage": cov, "auc_with": None, "auc_without": None,
+            "oof_without": None, "available": bool(sc)}
+    if not sc:
+        info["kept"] = False
+        return info
+    if mode is False:
+        info["kept"] = False
+        return info
+    if mode is True:
+        info["kept"] = True
+        return info
+    cols_ns = [c for c in cols if c not in SENT_COLS]
+    oof_ns, _ = walk_forward(D, cols_ns, cfg)
+    a1, a0 = _oof_auc(oof), _oof_auc(oof_ns)
+    info.update({"auc_with": a1, "auc_without": a0, "oof_without": oof_ns})
+    if not (np.isfinite(a1) and np.isfinite(a0)):
+        info["kept"] = False                                       # cannot prove it helps -> leave it out
+    else:
+        info["kept"] = bool(a1 > a0 + float(cfg.get("sent_margin", 0.01)))
+    return info
+
+
+def _ev_calibration(oof, cfg):
+    """Out-of-fold check of the expected-R head. Returns (a, b, enabled, rank_corr): ev = a + b * ev_hat."""
+    if not cfg.get("use_reg", True) or "ev_hat" not in oof.columns:
+        return 0.0, 0.0, False, float("nan")
+    m = oof["ev_hat"].notna().values
+    if m.sum() < 30:
+        return 0.0, 0.0, False, float("nan")
+    x = oof["ev_hat"].values[m].astype(float)
+    y = np.clip(oof["net"].values[m].astype(float), -2.0, 4.0)
+    if np.std(x) < 1e-9:
+        return 0.0, 0.0, False, float("nan")
+    b = float(np.clip(np.cov(x, y)[0, 1] / np.var(x, ddof=1), 0.0, 1.0))
+    a = float(y.mean() - b * x.mean())
+    rc = float(pd.Series(x).rank().corr(pd.Series(y).rank()))
+    return a, b, bool(b >= 0.10 and np.isfinite(rc) and rc > 0.05), rc
+
+
+def _member_auc(oof):
+    rows = []
+    try:
+        y = oof["y"].values.astype(int)
+        if len(y) < 20 or y.sum() in (0, len(y)):
+            return rows
+        for key, name in (("m_lr", "Logistic"), ("m_gb", "Gradient boosting"), ("m_et", "ExtraTrees"), ("p", "Ensemble")):
+            v = oof[key].values.astype(float)
+            ok_ = np.isfinite(v)
+            if ok_.sum() >= 20 and 0 < y[ok_].sum() < ok_.sum():
+                rows.append({"Member": name, "OOF AUC": round(auc_score(y[ok_], v[ok_]), 3)})
+    except Exception:
+        pass
+    return rows
+
+
 def train(jdf, hist=None, cfg=None):
     cfg = {**DEFAULT_CFG, **(cfg or {})}
     D = assemble(jdf, hist, cfg)
@@ -529,6 +809,12 @@ def train(jdf, hist=None, cfg=None):
     if n_live == 0 and "is_live" in cols:
         cols.remove("is_live")
     oof, scope = walk_forward(D, cols, cfg)
+    sent_info = _sentiment_decision(D, cols, cfg, oof)
+    if sent_info["kept"] is False and any(c in cols for c in SENT_COLS):
+        cols = [c for c in cols if c not in SENT_COLS]
+        if sent_info.get("oof_without") is not None:
+            oof = sent_info["oof_without"]
+    sent_info.pop("oof_without", None)
     reasons, ok = [], False
     metrics = {}
     prior, a_cal, b_cal = float(D.loc[D["src"] == ("live" if scope == "live" else "hist"), "y"].mean()), 0.0, 1.0
@@ -595,6 +881,8 @@ def train(jdf, hist=None, cfg=None):
         shrink = min(shrink, cfg["hist_cap"])
     status = ("ACTIVE_LIVE" if scope == "live" else "ACTIVE_HIST") if ok else "LEARNING"
 
+    ev_a, ev_b, ev_on, ev_rc = _ev_calibration(oof, cfg) if len(oof) else (0.0, 0.0, False, float("nan"))
+    member_auc = _member_auc(oof) if len(oof) else []
     imp_tab = []
     _tree_imps = [m.feature_importances_ for m in (full.get("gb"), full.get("et")) if m is not None]
     gbi = np.mean(_tree_imps, axis=0) if _tree_imps else None
@@ -607,7 +895,9 @@ def train(jdf, hist=None, cfg=None):
             "avg_loss": float(max(0.2, -loss.mean())) if len(loss) else 0.9,
             "n_live": n_live, "n_hist": n_hist, "n_eval": n_eval, "metrics": metrics,
             "thresholds": th, "reliability": rel, "by_status": by_status, "importance": imp_tab,
-            "gate": {"ok": ok, "reasons": reasons}, "has_gb": full["gb"] is not None, "has_et": full.get("et") is not None}
+            "gate": {"ok": ok, "reasons": reasons}, "has_gb": full["gb"] is not None, "has_et": full.get("et") is not None,
+            "sent": sent_info, "member_auc": member_auc,
+            "ev_cal": {"a": ev_a, "b": ev_b, "on": bool(ev_on), "rank_corr": ev_rc}}
 
 
 def save_model(pkg, path=MODEL_PATH):
@@ -665,14 +955,34 @@ def _active(pkg):
     return bool(pkg) and pkg.get("status") in ("ACTIVE_LIVE", "ACTIVE_HIST")
 
 
-def predict_frame(pkg, df):
-    """Final (calibrated, shrunk) P(win) for rows of a feature frame; is_live is forced to 1."""
+def predict_detail(pkg, df):
+    """Calibrated, disagreement-shrunk, base-rate-shrunk P(win) plus member spread and the R-regression."""
     d = df.copy()
     d["is_live"] = 1.0
-    p_raw, p_lr, p_gb, Xs = _predict_raw(pkg["model"], d)
+    mb = _predict_members(pkg["model"], d)
+    p_raw, p_lr, p_tree, Xs = _predict_raw(pkg["model"], d)
     a, b = pkg["calib"]
     pc = _sig(a + b * _logit(p_raw))
-    return pkg["prior"] + pkg["shrink"] * (pc - pkg["prior"]), p_lr, p_gb, Xs
+    p = pkg["prior"] + pkg["shrink"] * (pc - pkg["prior"])
+    spread = _spread(mb)
+    k = float(pkg.get("cfg", DEFAULT_CFG).get("spread_k", 3.0))
+    p = pkg["prior"] + (p - pkg["prior"]) * (1.0 - np.minimum(0.5, k * spread))
+    return {"p": p, "p_lr": p_lr, "p_tree": p_tree, "Xs": Xs, "spread": spread, "ev_hat": mb["ev_hat"]}
+
+
+def predict_frame(pkg, df):
+    """Final P(win) for rows of a feature frame; is_live is forced to 1."""
+    r = predict_detail(pkg, df)
+    return r["p"], r["p_lr"], r["p_tree"], r["Xs"]
+
+
+def _live_sent_row(feat):
+    """Sentiment features for 'now' (signal date - 1 day), direction- and market-aware."""
+    try:
+        sf = sentiment_features(time.time(), feat.get("is_stocks", 0.0), feat.get("is_long", 1.0))
+        return {c: (None if not np.isfinite(sf[c].iloc[0]) else float(sf[c].iloc[0])) for c in SENT_COLS}
+    except Exception:
+        return {}
 
 
 def predict_one(pkg, feat, parts):
@@ -681,12 +991,19 @@ def predict_one(pkg, feat, parts):
         return None
     row = {c: np.nan for c in ALL_COLS}
     row.update({k: v for k, v in feat.items() if v is not None})
+    if any(c in pkg["model"]["cols"] for c in SENT_COLS):
+        row.update({k: v for k, v in _live_sent_row(feat).items() if v is not None})
     for k, v in (parts or {}).items():
         if k in PART_KEYS:
             row["p_" + k] = float(v)
-    p, p_lr, p_gb, Xs = predict_frame(pkg, pd.DataFrame([row]))
-    p = float(p[0])
-    ev = p * pkg["avg_win"] - (1 - p) * pkg["avg_loss"]
+    r = predict_detail(pkg, pd.DataFrame([row]))
+    p, p_lr, p_gb, Xs = float(r["p"][0]), r["p_lr"], r["p_tree"], r["Xs"]
+    ev_p = p * pkg["avg_win"] - (1 - p) * pkg["avg_loss"]
+    ev, ev_r = ev_p, None
+    ec = pkg.get("ev_cal") or {}
+    if ec.get("on") and r["ev_hat"] is not None:
+        ev_r = float(ec["a"] + ec["b"] * r["ev_hat"][0])
+        ev = 0.5 * ev_p + 0.5 * ev_r                       # two independent views of expected R
     agree = None if p_gb is None else float(1 - min(1.0, 2 * abs(p_lr[0] - p_gb[0])))
     beta = pkg["model"]["beta"][1:]
     contrib = beta * Xs[0]
@@ -699,7 +1016,8 @@ def predict_one(pkg, feat, parts):
         call = "⛔ SKIP"
     else:
         call = "➖ NEUTRAL"
-    return {"p": p, "ev": float(ev), "agree": agree, "drivers": drivers, "status": pkg["status"], "call": call}
+    return {"p": p, "ev": float(ev), "ev_p": float(ev_p), "ev_reg": ev_r, "spread": float(r["spread"][0]),
+            "agree": agree, "drivers": drivers, "status": pkg["status"], "call": call}
 
 
 def live_check(pkg, jdf):
@@ -715,6 +1033,8 @@ def live_check(pkg, jdf):
     for c in ALL_COLS:
         if c not in L.columns:
             L[c] = np.nan
+    if any(c in pkg["model"]["cols"] for c in SENT_COLS):
+        L = _add_sentiment(L.assign(is_stocks=L["is_stocks"], is_long=L["is_long"]).reset_index(drop=True))
     p = predict_frame(pkg, L)[0]
     y = L["y"].values
     prior = pkg["prior"]
@@ -786,6 +1106,27 @@ def render_tab(st, jdf, cfg, use_hist):
             k4.metric("Win % in AI top third", f"{th[1]['Win %']:.0f}%", f"avg {th[1]['Avg R (net)']:+.2f}R", delta_color="off")
         k5.metric("Shrink weight", f"{pkg['shrink'] * 100:.0f}%", help="Share of the model deviation from the base rate "
                                                                         "that is passed on to forecasts.")
+        if pkg.get("member_auc"):
+            st.markdown("**Ensemble members** (out-of-fold AUC: does each model add anything beyond the logistic baseline?)")
+            st.dataframe(pd.DataFrame(pkg["member_auc"]), hide_index=True, width="content")
+        sn = pkg.get("sent") or {}
+        if sn.get("available") or sn.get("auc_with") is not None:
+            if sn.get("kept"):
+                st.success(f"Market sentiment is IN the model: OOF AUC {sn['auc_with']:.3f} with vs "
+                           f"{sn['auc_without']:.3f} without." if sn.get("auc_without") is not None else
+                           "Market sentiment is IN the model (forced on).")
+            else:
+                st.info("Market sentiment was tested and left OUT"
+                        + (f": OOF AUC {sn['auc_with']:.3f} with vs {sn['auc_without']:.3f} without (needs a clear gain)."
+                           if sn.get("auc_with") is not None and np.isfinite(sn["auc_with"]) and np.isfinite(sn["auc_without"])
+                           else " (could not be shown to help, or no sentiment data was reachable)."))
+        elif cfg.get("use_sentiment", "auto") is not False:
+            st.caption("Sentiment data unavailable at training time (no network / source down): model trained without it.")
+        ec = pkg.get("ev_cal") or {}
+        if ec:
+            st.caption("Expected-R regression head: " + (
+                f"ON (slope {ec['b']:.2f}, rank corr {ec['rank_corr']:+.2f} out-of-fold), blended 50/50 with the probability-based EV."
+                if ec.get("on") else "OFF (did not validate out-of-fold): EV comes from P(win) only."))
         if pkg.get("by_status"):
             st.markdown("**By signal type** (out-of-fold: is WATCH worth trading, and does the AI separate it?)")
             st.dataframe(pd.DataFrame(pkg["by_status"]), hide_index=True, width="content")
@@ -822,4 +1163,8 @@ def render_tab(st, jdf, cfg, use_hist):
             "- Markets change. Weights decay with a 2-year half-life and the live check watches for drift.\n"
             "- Historical rows come from the Backtest tab (today's survivors, price features only, down-weighted) "
             "and are never used to claim live accuracy while ≥ 30 live signals exist.\n"
+            "- **Sentiment** = crypto Fear & Greed / stocks VIX percentile, looked up the day BEFORE each signal so there is "
+            "no look-ahead, and back-filled onto old rows. It is kept only if it improves out-of-fold AUC. Per-symbol news "
+            "headlines are not a model input (no history to train on).\n"
+            "- **Disagreement**: when logistic and tree models disagree, the probability is pulled further toward the base rate.\n"
             "- The AI score is **not** part of the conviction grade, so the model never trains on its own output.")

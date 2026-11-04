@@ -7,6 +7,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from urllib.parse import quote
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -2105,8 +2106,11 @@ ai_sort = st.sidebar.toggle("Sort MATCH/WATCH by AI P(win)", False)
 ai_watch = st.sidebar.toggle("Log + train on WATCH signals too", True,
                              help="WATCH = all timeframes but one matched. More samples, faster learning. "
                                   "Off = MATCH only (older WATCH rows in the journal are then ignored by the AI).")
+ai_sent = st.sidebar.selectbox("Market sentiment in the AI (Fear&Greed / VIX)", ["auto (keep only if it helps)", "always on", "off"],
+                               help="auto = trained with and without sentiment; kept only if out-of-fold AUC improves clearly.")
 ai_cfg = {"min_n": int(ai_min_n), "use_gb": bool(ai_gb), "cost_bps": float(ai_cost),
-          "include_watch": bool(ai_watch)}
+          "include_watch": bool(ai_watch),
+          "use_sentiment": {"always on": True, "off": False}.get(ai_sent, "auto")}
 
 st.sidebar.subheader("EMA criteria presets")
 preset_name = st.sidebar.selectbox(

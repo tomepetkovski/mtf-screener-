@@ -19,6 +19,10 @@ try:
     import ml_engine as ml          # AI layer (optional: the app runs without it)
 except Exception:
     ml = None
+try:
+    import decision_engine as de   # [decision-patch]
+except Exception:
+    de = None
 
 st.set_page_config(page_title="MTF EMA Screener Pro", page_icon="📈", layout="wide")
 
@@ -1689,6 +1693,8 @@ def enrich_rows(market, src, syms, tf, n_break, vol_mult, live, oi_lb, fh_key, l
         res = dict(ex.map(one, syms))
     if stocks:
         cal = earnings_calendar(fh_key) if fh_key else None
+        if cal is None and de is not None:      # free fallback: no Finnhub key needed
+            cal = de.nasdaq_earnings_calendar(fetch, NQ, NQ_HDR, _clean_sym)
         for s in syms:
             label, days = earn_info(cal, s)
             res[s]["Earnings"], res[s]["_ed"] = label, days
@@ -2112,6 +2118,12 @@ ai_cfg = {"min_n": int(ai_min_n), "use_gb": bool(ai_gb), "cost_bps": float(ai_co
           "include_watch": bool(ai_watch),
           "use_sentiment": {"always on": True, "off": False}.get(ai_sent, "auto")}
 
+st.sidebar.subheader("🎯 Decision layer")
+max_pos = st.sidebar.slider("Max diversified picks", 1, 20, 6)
+max_corr = st.sidebar.slider("Skip names correlated >= (sector twin)", 0.2, 0.9, 0.5, 0.05,
+                             help="Correlation of daily returns after removing the market-wide move.")
+max_heat = st.sidebar.number_input("Max total risk (% of equity)", 1.0, 20.0, 6.0, 0.5)
+
 st.sidebar.subheader("EMA criteria presets")
 preset_name = st.sidebar.selectbox(
     "Preset",
@@ -2243,6 +2255,13 @@ if extras_on:
         df["AI EV (R)"] = pd.to_numeric(df["Symbol"].map(
             lambda s: ai_pred[s]["ev"] if s in ai_pred else None), errors="coerce").round(2)
         df["AI call"] = df["Symbol"].map(lambda s: ai_pred[s]["call"] if s in ai_pred else None)
+
+    if de is not None and extra:
+        _ai_act = bool(ai_model and ml is not None and ml._active(ai_model))
+        _tev = float((ai_model or {}).get('cfg', {}).get('take_ev', 0.10)) if ai_model else 0.10
+        _dec = de.build_decisions(df, extra, conv_map, ai_pred, _ai_act, regime, macro_h, long_bias, _tev)
+        for _c in ('Rank %', 'Decision', 'Risk x', 'Why'):
+            df[_c] = df['Symbol'].map(_dec[_c]) if not _dec.empty else None
 
     as_map = {s: v.get("_as") for s, v in extra.items()}
     ed_map = {s: v.get("_ed") for s, v in extra.items()}
@@ -2382,6 +2401,18 @@ for _c in ("Breakout", "Flow", "OI", "Book", "Funding", "L/S", "Crowding", "Earn
         if _c in df.columns and _c not in cfg:
             cfg[_c] = st.column_config.TextColumn(_c)
 
+if de is not None and "Decision" in match.columns and not match.empty:
+    _ok = match[match["Decision"].isin(["✅ TAKE", "🟡 CANDIDATE"])].sort_values("Rank %", ascending=False)
+    if not _ok.empty:
+        _cm = {s_: get_closes(_store(), data_src, s_, "1d") for s_ in _ok["Symbol"].head(40)}
+        _picks, _skip = de.select_diversified(list(_cm), _cm, max_pos, max_corr)
+        _rx = dict(zip(match["Symbol"], match["Risk x"]))
+        _alloc, _tot, _sc = de.portfolio_risk(_picks, _rx, 1.0, max_heat)
+        st.markdown("### 🎯 Diversified picks (risk % of equity at a 1% base)")
+        st.dataframe(pd.DataFrame({"Symbol": _picks, "Risk %": [_alloc[s_] for s_ in _picks]}), hide_index=True)
+        st.caption(f"Total risk {_tot}% (scale {_sc}). Skipped as near-duplicates: "
+                   + (", ".join(f"{s_}≈{v_[0]} ({v_[1]:.2f})" for s_, v_ in _skip.items()) or "none"))
+
 t1, t2, t3, t4, t5, t6, t7 = st.tabs(["✅ MATCH", "👀 WATCH", "All", "🎯 Trade planner", "📒 Journal", "🧪 Backtest",
                                        "🤖 AI model"])
 for key, tab, data in (("match", t1, match), ("watch", t2, watch), ("all", t3, df)):
@@ -2474,7 +2505,9 @@ with t4:
                            "_ed": exs.get("_ed"), "_ext": ext_atr(cdf, lf, live), "_adx": adx(cdf)}
                 cv, parts = conviction2(ex_live, long, "MATCH" if sym in now else "WATCH", regime, macro_h)
                 blocked = blocked_tps(lv, entry, tps, long)
-                qty = (equity * risk_pct / 100) / risk
+                _rxs = df.loc[df["Symbol"] == sym, "Risk x"] if "Risk x" in df.columns else []
+                _rx1 = float(_rxs.iloc[0]) if len(_rxs) and pd.notna(_rxs.iloc[0]) else 1.0
+                qty = (equity * risk_pct * _rx1 / 100) / risk
                 if is_stocks:
                     qty = float(int(qty))
                 dd = get_candles(data_src, sym, "1d")

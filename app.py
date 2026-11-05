@@ -1360,7 +1360,7 @@ def journal_plan(cdf, long, live, atr_mult, rr):
             "bar_t": int(pd.Timestamp(d["t"].iloc[-1]).timestamp() * 1000)}
 
 def extras_json(ex, regime):
-    keys = ("Breakout", "Crash", "Flow", "OI", "Book", "Funding", "L/S", "Crowding", "Earnings", "Analyst")
+    keys = ("Breakout", "Crash", "Flow", "OI", "Book", "Funding", "L/S", "Crowding", "Earnings", "Analyst", "Turn")
     d = {k: ex.get(k) for k in keys if ex.get(k) is not None}
     for k in ("RS 1w %", "RS 4w %"):
         if ex.get(k) is not None:
@@ -1657,6 +1657,8 @@ def enrich_rows(market, src, syms, tf, n_break, vol_mult, live, oi_lb, fh_key, l
             fl = volume_flow(cdf, live)
             out["Flow"] = flow_text(fl)
             out["_dz"] = fl[2] if fl else None
+            tn = turn_signal(get_closes(store, src, s, "1h"), long_bias, live)
+            out["Turn"], out["_turn"] = tn if tn else ("n/a", None)
             out["_plan"] = journal_plan(cdf, long_bias, live, j_atr, j_rr)
             if ml is not None:
                 out["_feat"] = ml.live_features(cdf, long_bias, lf_, ls_,
@@ -1698,6 +1700,7 @@ def enrich_rows(market, src, syms, tf, n_break, vol_mult, live, oi_lb, fh_key, l
         for s in syms:
             label, days = earn_info(cal, s)
             res[s]["Earnings"], res[s]["_ed"] = label, days
+            res[s]["_eh"] = ((cal or {}).get(s) or ("", ""))[1]
     if stocks and fh_key:
         for i, s in enumerate(syms):
             if i >= ANALYST_MAX:
@@ -1733,6 +1736,18 @@ def ext_atr(df, lf, live=True):
     if not e or not np.isfinite(a) or a <= 0:
         return None
     return (c[-1] - e[-1]) / a
+
+
+def turn_signal(closes, long, live=True):
+    """(label, +1 with you / 0 basing / -1 against) from closed 1h bars: price vs EMA9 and its slope."""
+    c = list(closes[:-1]) if (live and closes) else list(closes or [])
+    e = ema_series(c, 9)
+    if len(e) < 4:
+        return None
+    sg = 1 if long else -1
+    up, dn = c[-1] > e[-1] and e[-1] > e[-4], c[-1] < e[-1] and e[-1] < e[-4]
+    v = sg * (1 if up else -1 if dn else 0)
+    return {1: "🟢 turning", 0: "🟡 basing", -1: "🔴 still against"}[v], v
 
 
 def adx(df, n=14):
@@ -2226,7 +2241,7 @@ if extras_on:
     except Exception:
         regime = None
     for col in ("Breakout", "Crash", "Flow", "OI", "Book", "Funding", "L/S", "Crowding",
-                "RS 1w %", "RS 4w %", "Earnings", "Analyst"):
+                "RS 1w %", "RS 4w %", "Earnings", "Analyst", "Turn"):
         if any(col in v for v in extra.values()):
             df[col] = df["Symbol"].map(lambda s, c=col: extra.get(s, {}).get(c))
     for col in ("Crash", "RS 1w %", "RS 4w %"):
@@ -2259,6 +2274,10 @@ if extras_on:
     if de is not None and extra:
         _ai_act = bool(ai_model and ml is not None and ml._active(ai_model))
         _tev = float((ai_model or {}).get('cfg', {}).get('take_ev', 0.10)) if ai_model else 0.10
+        if "1w %200" in df.columns:
+            for _s, _v in zip(df["Symbol"], pd.to_numeric(df["1w %200"], errors="coerce")):
+                if _s in extra and pd.notna(_v):
+                    extra[_s]["_w200"] = float(_v)
         _dec = de.build_decisions(df, extra, conv_map, ai_pred, _ai_act, regime, macro_h, long_bias, _tev)
         for _c in ('Rank %', 'Decision', 'Risk x', 'Why'):
             df[_c] = df['Symbol'].map(_dec[_c]) if not _dec.empty else None
@@ -2397,7 +2416,7 @@ if "AI P(win)" in df.columns:
     cfg["AI P(win)"] = st.column_config.ProgressColumn("AI P(win)", min_value=0, max_value=100, format="%.0f%%")
     cfg["AI EV (R)"] = st.column_config.NumberColumn("AI EV (R)", format="%+.2f")
 for _c in ("Breakout", "Flow", "OI", "Book", "Funding", "L/S", "Crowding", "Earnings", "Analyst",
-               "RS 1w %", "RS 4w %"):
+               "RS 1w %", "RS 4w %", "Turn"):
         if _c in df.columns and _c not in cfg:
             cfg[_c] = st.column_config.TextColumn(_c)
 

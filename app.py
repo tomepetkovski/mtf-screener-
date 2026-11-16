@@ -2744,14 +2744,19 @@ with t8:
         r_min = q2.slider("Min coil score", 30, 90, 50, 5, key="rd_min")
         r_dv = q3.number_input("Min avg daily $ volume", 0, 10**11, 1_000_000 if is_stocks else 100_000, 100_000, key="rd_dv")
         r_ph = q4.multiselect("Phases", ["COILED", "TRIGGER", "FORMING"], default=["COILED", "TRIGGER"], key="rd_ph")
+        def _daily(s):                      # honours the sidebar "live price" toggle (off = closed bars only)
+            d_ = get_candles(data_src, s, "1d")
+            return d_ if (d_ is None or live) else d_.iloc[:-1]
+
         if st.button("🧲 Run radar on the whole universe", key="rd_run"):
-            bdf = get_candles(data_src, "SPY" if is_stocks else "BTCUSDT", "1d")
+            bdf = _daily("SPY" if is_stocks else "BTCUSDT")
             bench = None if bdf is None else bdf["close"].tolist()
             with st.spinner(f"Reading daily candles of {len(df)} symbols (first run is slow, later runs use the cache)..."):
-                st.session_state["radar"] = ze.scan_universe(
-                    list(df["Symbol"]), lambda s: get_candles(data_src, s, "1d"), r_long, bench, r_min, r_dv,
-                    tuple(r_ph), workers=12 if is_stocks else 24)
-        res = st.session_state.get("radar")
+                st.session_state["radar"] = (market, ze.scan_universe(
+                    list(df["Symbol"]), _daily, r_long, bench, r_min, r_dv,
+                    tuple(r_ph), workers=12 if is_stocks else 16))
+        _rs_ = st.session_state.get("radar")
+        res = _rs_[1] if (_rs_ and _rs_[0] == market) else None     # never show crypto results on the stocks market
         if res is not None:
             if not res:
                 st.info("Nothing coiled right now with these filters. That is normal: real coils are rare.")
@@ -2785,7 +2790,7 @@ with t8:
             syms_ = list(df["Symbol"])
             random.Random(11).shuffle(syms_)
             with st.spinner("Backtesting..."):
-                st.session_state["radar_bt"] = ze.backtest(syms_[:bt_n], lambda s: get_candles(data_src, s, "1d"), r_long, bt_cost)
+                st.session_state["radar_bt"] = ze.backtest(syms_[:bt_n], _daily, r_long, bt_cost)
         tbt = st.session_state.get("radar_bt")
         if tbt is not None:
             sm = ze.summarize(tbt)

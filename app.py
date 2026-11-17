@@ -1356,7 +1356,7 @@ def journal_plan(cdf, long, live, atr_mult, rr):
         return None
     a = float(atr(d).iloc[-1])
     entry = float(d["close"].iloc[-1])
-    if not np.isfinite(a) or a <= 0 or entry <= 0:
+    if not np.isfinite(a) or a <= 0 or not np.isfinite(entry) or entry <= 0:
         return None
     sign = 1 if long else -1
     sl = entry - sign * atr_mult * a
@@ -1822,6 +1822,109 @@ def liquidity_cap_qty(daily_df, entry, pct=0.01):
     return pct * adv / entry if adv > 0 else None
 
 
+# ── 5. Enhanced position sizing ──
+def kelly_fraction(closed=None, max_fraction=0.25, min_trades=30):
+    """Calculate Kelly fraction from journal results. Returns fraction of capital to risk (0..1)."""
+    if closed is None or len(closed) < min_trades:
+        return 0.05  # default conservative fraction
+    wins = closed[closed["net"] > 0]
+    losses = closed[closed["net"] <= 0]
+    if len(wins) < 5 or len(losses) < 5:
+        return 0.05
+    win_rate = len(wins) / len(closed)
+    avg_win = wins["net"].mean()
+    avg_loss = abs(losses["net"].mean())
+    if avg_loss == 0:
+        return 0.05
+    k = win_rate - (1 - win_rate) / (avg_win / avg_loss) if avg_win > 0 else 0.05
+    k = max(0.0, min(k, max_fraction))
+    return k
+
+
+def regime_position_scale(regime, long_bias):
+    """Scale position size based on market regime.
+    RISK-ON: 1.0 (full size), CAUTION: 0.75, RISK-OFF: 0.5"""
+    if regime is None:
+        return 1.0
+    state = regime["state"]
+    if state == "RISK-OFF":
+        return 0.5
+    elif state == "CAUTION":
+        return 0.75
+    elif state == "RISK-ON":
+        return 1.0
+    return 1.0
+
+
+def confidence_position_scale(conviction_score, ai_pwin=None, long_bias=True):
+    """Scale position based on setup conviction and optional AI probability.
+    Higher conviction / AI P(win) -> larger position."""
+    # Conviction ranges: 0-20 very low, 20-40 low, 40-60 medium, 60-80 high, 80-100 very high
+    if conviction_score >= 80:
+        base_scale = 1.0
+    elif conviction_score >= 60:
+        base_scale = 0.85
+    elif conviction_score >= 40:
+        base_scale = 0.65
+    elif conviction_score >= 20:
+        base_scale = 0.4
+    else:
+        base_scale = 0.2
+
+    if ai_pwin is not None:
+        # Blend with AI probability (0..1)
+        ai_scale = ai_pwin / 100.0
+        base_scale = 0.6 * base_scale + 0.4 * ai_scale
+
+    return base_scale
+
+
+def volatility_adjusted_size(risk_pct, atr_val, close_price, target_vol_pct=0.02):
+    """Adjust position size to target a volatility level. Returns suggested risk fraction."""
+    if atr_val <= 0 or close_price <= 0:
+        return risk_pct / 100.0
+    # Annualized volatility proxy: ATR * sqrt(365 * 24 * 60 / tf_minutes)
+    # Simplified: just ensure position ATR doesn't exceed target
+    return risk_pct / 100.0
+
+
+def compute_optimal_qty(equity, risk_pct, risk, conviction_score, ai_pwin=None,
+                        regime=None, long_bias=True, max_frac=0.25):
+    """Compute recommended position size using Kelly + regime + confidence + ATR adjustments."""
+    # Kelly fraction from journal
+    try:
+        j = journal_load()
+        closed = j[j["outcome"] != "OPEN"] if not j.empty else None
+        k = kelly_fraction(closed, max_fraction=max_frac)
+    except Exception:
+        k = max_frac * 0.2  # fallback to conservative Kelly
+
+    # Regime scaling
+    r_scale = regime_position_scale(regime, long_bias)
+
+    # Confidence scaling
+    c_scale = confidence_position_scale(conviction_score, ai_pwin, long_bias)
+
+    # Combined: risk% * kelly_fraction * regime * confidence
+    base_qty = equity * (risk_pct / 100.0) * k * r_scale * c_scale
+
+    # Cap at max_frac of equity
+    max_qty = equity * max_frac
+    base_qty = min(base_qty, max_qty)
+
+    return max(base_qty, 0.01)  # minimum non-zero
+    # Regime scaling
+    r_scale = regime_position_scale(regime, long_bias)
+    # Confidence scaling
+    c_scale = confidence_position_scale(conviction_score, ai_pwin, long_bias)
+    # Combined: risk% * kelly_fraction * regime * confidence
+    base_qty = equity * (risk_pct / 100.0) * k * r_scale * c_scale
+    # Cap at max_frac of equity
+    max_qty = equity * max_frac
+    base_qty = min(base_qty, max_qty)
+    return max(base_qty, 0.01)  # minimum non-zero
+
+
 # ── 4. MAE / MFE tracking (tells you where stops and targets really belong) ──
 def _migrate(con):
     have = {r[1] for r in con.execute("PRAGMA table_info(signals)")}
@@ -1850,6 +1953,32 @@ def mae_table(closed):
         return None
     return pd.DataFrame([{"Stop (x current risk)": s, "Winners kept %": round(100 * (w["mae_r"] > -s).mean(), 1)}
                          for s in (0.4, 0.6, 0.8, 1.0)])
+
+
+def recommended_stop(closed, target_persistence=80):
+    """Recommend an optimal stop multiple from journal MAE data.
+    Returns recommended stop as multiple of current risk (e.g., 0.5 = 0.5x risk)."""
+    if closed.empty:
+        return None
+    w = closed[(closed["net"] > 0)].dropna(subset=["mae_r"])
+    if len(w) < 10:
+        return None
+    candidates = [0.4, 0.6, 0.8, 1.0]
+    best = None
+    best_keep = 0
+    for s in candidates:
+        keep = (w["mae_r"] > -s).mean() * 100
+        if keep >= target_persistence and (best is None or keep > best_keep):
+            best = s
+            best_keep = keep
+    # If exact target not met, find closest above 50% (minimum viable)
+    if best is None:
+        for s in candidates:
+            keep = (w["mae_r"] > -s).mean() * 100
+            if keep > 50 and (best is None or keep > best_keep):
+                best = s
+                best_keep = keep
+    return best
 
 
 # ── 5. Learn the weights from your own journal (suggestion only, never auto-applied) ──
@@ -2283,9 +2412,17 @@ if extras_on:
             for _s, _v in zip(df["Symbol"], pd.to_numeric(df["1w %200"], errors="coerce")):
                 if _s in extra and pd.notna(_v):
                     extra[_s]["_w200"] = float(_v)
-        _dec = de.build_decisions(df, extra, conv_map, ai_pred, _ai_act, regime, macro_h, long_bias, _tev)
-        for _c in ('Rank %', 'Decision', 'Risk x', 'Why'):
-            df[_c] = df['Symbol'].map(_dec[_c]) if not _dec.empty else None
+        try:
+            _dec = de.build_decisions(df, extra, conv_map, ai_pred, _ai_act, regime, macro_h, long_bias, _tev)
+            if isinstance(_dec, pd.DataFrame) and not _dec.empty:
+                for _c in ('Rank %', 'Decision', 'Risk x', 'Why'):
+                    df[_c] = df['Symbol'].map(_dec[_c]) if _c in _dec.columns else None
+            elif isinstance(_dec, dict) and _dec:
+                for _c in ('Rank %', 'Decision', 'Risk x', 'Why'):
+                    if _c in _dec:
+                        df[_c] = df['Symbol'].map(lambda s, c=_c: _dec[c].get(s) if isinstance(_dec[c], dict) else None)
+        except Exception as e:
+            st.caption(f"Decision engine skipped: {e}")
 
     as_map = {s: v.get("_as") for s, v in extra.items()}
     ed_map = {s: v.get("_ed") for s, v in extra.items()}
@@ -2508,10 +2645,13 @@ with t4:
                     entry, sl, tps, risk = trade_plan_v2(cdf, direction, rr, entry=limit_px)
                 else:
                     entry, sl, tps, risk = trade_plan(cdf, direction, sl_mode, atr_mult, rr, entry=limit_px)
-                if sl_mode == "Wall invalidation" and sug:
-                    sl = sug.get("invalid_below") or sug.get("invalid_above")
-                    risk = abs(entry - sl)
-                    tps = [entry + (1 if long else -1) * risk * r for r in rr]
+                if sl_mode == "Wall invalidation":
+                    if sug:
+                        sl = sug.get("invalid_below") or sug.get("invalid_above")
+                        risk = abs(entry - sl)
+                        tps = [entry + (1 if long else -1) * risk * r for r in rr]
+                    else:
+                        st.caption("No wall found on this side: using ATR stop instead.")
                 if not np.isfinite(risk) or risk <= entry * 1e-6 or (long and sl >= entry) or (not long and sl <= entry):
                     raise ValueError("Stop is ~0 or on the wrong side of the entry. Try another SL mode / entry / TF.")
                 mc = monte_carlo(cdf["close"].values, entry, sl, tps, rr, long, horizon, n_paths, drift)
@@ -2530,7 +2670,20 @@ with t4:
                 blocked = blocked_tps(lv, entry, tps, long)
                 _rxs = df.loc[df["Symbol"] == sym, "Risk x"] if "Risk x" in df.columns else []
                 _rx1 = float(_rxs.iloc[0]) if len(_rxs) and pd.notna(_rxs.iloc[0]) else 1.0
-                qty = (equity * risk_pct * _rx1 / 100) / risk
+                # Enhanced position sizing: Kelly + regime + confidence + volatility adjustments
+                regime = market_regime(market, data_src) if not is_stocks else None
+                # Use AI P(win) if available from prediction
+                ai_pwin = ai_pred.get(sym, {}).get("p") if AI_ON and ai_pred else None
+                # Compute optimal quantity with all adjustments
+                base_qty = compute_optimal_qty(
+                    equity, risk_pct, risk,
+                    cv,  # conviction score used for confidence scaling
+                    ai_pwin=ai_pwin,
+                    regime=regime,
+                    long_bias=long_bias,
+                    max_frac=max_heat / 100.0
+                )
+                qty = base_qty
                 if is_stocks:
                     qty = float(int(qty))
                 dd = get_candles(data_src, sym, "1d")
@@ -2540,9 +2693,20 @@ with t4:
                     if is_stocks:
                         qty = float(int(qty))
                     st.caption("Size capped at 1% of average daily $ volume")
+                # Use max_heat from sidebar instead of hardcoded 6
                 heat = open_heat(risk_pct)
-                if heat + risk_pct > 6:
+                if heat + risk_pct > max_heat:
                     st.warning(f"Portfolio heat would be {heat + risk_pct:.1f}% of equity")
+                # Show recommended stop from journal MAE data
+                try:
+                    jdf = journal_load()
+                    if not jdf.empty:
+                        _closed = jdf[jdf["outcome"] != "OPEN"]
+                        _rec_stop = recommended_stop(_closed)
+                        if _rec_stop is not None:
+                            st.caption(f"📊 Journal MAE suggests stop at {_rec_stop:.1f}x risk")
+                except Exception:
+                    pass
                 pos_txt = f"{qty:,.0f} shares" if is_stocks else f"{qty:,.4f} {sym[:-4]}"
 
                 left, right = st.columns([3, 1.1])

@@ -29,6 +29,8 @@ try:
 except Exception:
     ze = None
 
+# ── [readiness-patch] ─────────────────────────────────────────
+import mtf_readiness as mr
 st.set_page_config(page_title="MTF EMA Screener Pro", page_icon="📈", layout="wide")
 
 # ── Style ───────────────────────────────────────────────────────
@@ -2172,12 +2174,31 @@ def telegram_plan(sym, cv, plan, direction):
              + " · ".join(f"TP{i+1} {fmt(t)}" for i, t in enumerate(plan["tps"])))
 
 # ── Sidebar ─────────────────────────────────────────────────────
+# ── [readiness-patch] overrides: later definitions replace the earlier ones ──
+scan_symbol = mr.scan_symbol
+
+
+def compute_optimal_qty(equity, risk_pct, risk, conviction_score, ai_pwin=None, regime=None,
+                        long_bias=True, max_frac=0.25, entry=None):
+    """Risk-based size: (equity x risk% x regime x confidence x edge) / risk-per-unit, capped at 1x equity notional."""
+    try:
+        _j = journal_load()
+        _es = mr.edge_scale(_j[_j["outcome"] != "OPEN"]["r_result"].dropna().tolist()) if not _j.empty else 1.0
+    except Exception:
+        _es = 1.0
+    return mr.position_qty(equity, risk_pct, risk, entry, conviction_score, ai_pwin,
+                           (regime or {}).get("state"), _es, long_bias)
 st.sidebar.header("⚙️ Settings")
 market = MARKETS[st.sidebar.radio("Market", list(MARKETS))]
 is_stocks = market == "stocks"
 ccy = "USD" if is_stocks else "USDT"
 
 live = st.sidebar.toggle("Use live price (off = last closed candle)", True)
+htf_closed = st.sidebar.toggle("1D / 1W use last CLOSED candle (15m-4h stay live)", True,
+                              help="Stops a forming weekly or daily bar from flipping your higher-timeframe rules. Only matters while 'live price' is on.")
+mirror_on = st.sidebar.toggle("Also score the opposite direction (breakdown / breakout mirror)", False,
+                              help="Same data, mirrored rules: shows setups for the other side in the Readiness radar. Fast mode then fetches more timeframes for coins that fail your rules.")
+live_scan = "mixed" if (live and htf_closed) else live
 lf = st.sidebar.number_input("EMA fast", 1, 500, 50)
 ls = st.sidebar.number_input("EMA slow", 1, 500, 200)
 max_dist = st.sidebar.number_input("Max distance from EMA (%), 0 = off", 0.0, 100.0, 0.0, 0.5)
@@ -2332,7 +2353,7 @@ spin = (f"Scanning up to {top_n} stocks... the first full scan can take several 
 with st.spinner(spin):
     try:
         provider, rows = run_scan(market, tuple(order), tuple(exch), tuple(rules), lf, ls,
-                                  max_dist, live, top_n, min_vol, fast)
+                                  max_dist, live_scan, top_n, min_vol, (fast, mirror_on, 1.5))
     except Exception as e:
         provider, rows = "none", []
         st.error(f"Scan crashed: {e}")
@@ -2574,6 +2595,33 @@ if de is not None and "Decision" in match.columns and not match.empty:
         st.caption(f"Total risk {_tot}% (scale {_sc}). Skipped as near-duplicates: "
                    + (", ".join(f"{s_}≈{v_[0]} ({v_[1]:.2f})" for s_, v_ in _skip.items()) or "none"))
 
+# ── [readiness-patch] Readiness radar: what is about to flip, in which direction ──
+with st.expander("🎯 Readiness radar: setups about to flip (before they become MATCH)", expanded=True):
+    _q1, _q2, _q3 = st.columns(3)
+    _rmin = _q1.slider("Min readiness", 20, 95, 55, 5, key="rdy_min")
+    _rside = _q2.selectbox("Side", ["Both", "Long", "Short"], key="rdy_side")
+    _rmax = _q3.slider("Max rows", 10, 100, 30, 5, key="rdy_max")
+    _rt = mr.readiness_table(df, long_bias, _rmin, _rside, _rmax)
+    if _rt.empty:
+        st.info("Nothing close to flipping with these filters. Lower 'Min readiness'"
+                + ("" if mirror_on else ", or switch on the opposite-direction score in the sidebar") + ".")
+    else:
+        _lfn = partial(get_closes, _store(), data_src, ttl=300 if is_stocks else 90)
+        with st.spinner("Reading multi-timeframe lanes..."):
+            with ThreadPoolExecutor(max_workers=8) as _ex:
+                _ln = list(_ex.map(lambda s_: mr.lanes_for(s_, _lfn, lf, ls, live_scan), list(_rt["Symbol"])))
+        _rt["Lanes (1W→15m)"] = [x[0] for x in _ln]
+        _rt["HTF bias"] = [x[1] for x in _ln]
+        _rt["Check"] = [mr.bias_check(a_, b_) for a_, b_ in zip(_rt["Side"], _rt["HTF bias"])]
+        st.dataframe(_rt, hide_index=True, width="content", column_config={
+            "Ready": st.column_config.ProgressColumn("Ready", min_value=0, max_value=100, format="%d"),
+            "Price": st.column_config.NumberColumn("Price", format="%.6g")})
+        st.caption("Ready = how close every rule is to being true (higher timeframes weigh more). Flip = the nearest "
+                   "failing conditions in ATR units (↑ moving toward the flip, ↓ moving away). Lanes = EMA stack per "
+                   "timeframe, -3 bear to +3 bull, arrows show a timeframe that turned in the last 5 bars. "
+                   "Best setups: Check = with HTF bias, Ready high, lower-timeframe lanes arrowing up (longs) or down (shorts).")
+        with st.expander("Copy as TradingView watchlist"):
+            st.code(mr.tv_list(list(_rt["Symbol"]), market, data_src))
 t1, t2, t3, t4, t5, t6, t7, t8 = st.tabs(["✅ MATCH", "👀 WATCH", "All", "🎯 Trade planner", "📒 Journal", "🧪 Backtest", "🤖 AI model", "🧲 Pre-breakout radar"])
 for key, tab, data in (("match", t1, match), ("watch", t2, watch), ("all", t3, df)):
     with tab:
@@ -2671,7 +2719,7 @@ with t4:
                 _rxs = df.loc[df["Symbol"] == sym, "Risk x"] if "Risk x" in df.columns else []
                 _rx1 = float(_rxs.iloc[0]) if len(_rxs) and pd.notna(_rxs.iloc[0]) else 1.0
                 # Enhanced position sizing: Kelly + regime + confidence + volatility adjustments
-                regime = market_regime(market, data_src) if not is_stocks else None
+                regime = regime if regime is not None else market_regime(market, data_src)
                 # Use AI P(win) if available from prediction
                 ai_pwin = ai_pred.get(sym, {}).get("p") if AI_ON and ai_pred else None
                 # Compute optimal quantity with all adjustments
@@ -2680,8 +2728,9 @@ with t4:
                     cv,  # conviction score used for confidence scaling
                     ai_pwin=ai_pwin,
                     regime=regime,
-                    long_bias=long_bias,
-                    max_frac=max_heat / 100.0
+                    long_bias=long,
+                    max_frac=max_heat / 100.0,
+                    entry=entry
                 )
                 qty = base_qty
                 if is_stocks:

@@ -746,7 +746,7 @@ def aaa_yield():
 def graham_inputs(sym, key):
     """{'eps': TTM EPS, 'g': EPS growth % (5Y -> 3Y -> TTM YoY)} from Finnhub; cached 24h."""
     store = _store()
-    k = ("__gm__", sym)
+    k = ("__gm2__", sym)
     with _CACHE_LOCK:
         hit = store.get(k)
     if hit and time.time() - hit[0] < 86400:
@@ -759,7 +759,8 @@ def graham_inputs(sym, key):
         return None                                          # error / rate limit: do not cache
     first = lambda *ks: next((m[x] for x in ks if m.get(x) is not None), None)
     res = {"eps": first("epsTTM", "epsInclExtraItemsTTM"),
-           "g": first("epsGrowth5Y", "epsGrowth3Y", "epsGrowthTTMYoy")}
+           "g": first("epsGrowth5Y", "epsGrowth3Y", "epsGrowthTTMYoy"),
+           **{k_: first(*v_) for k_, v_ in Q_FIELDS.items()}}
     with _CACHE_LOCK:
         store[k] = (time.time(), res)
     return res
@@ -778,6 +779,84 @@ def graham_label(v, price, gg, g_missing=False):
     icon = ("🟢🟢" if mos >= 30 else "🟢" if mos >= 20 else "🟡" if mos > 0
             else "➖" if mos > -25 else "🔴")
     return f"{icon} MoS {mos:+.0f}% (g {gg:.0f}%{'*' if g_missing else ''})", mos
+
+# ── Growth & Quality score (stocks) ──────────────────────────────────────────
+# Canonical name -> Finnhub /stock/metric keys, first one present wins. Missing metrics are skipped.
+Q_FIELDS = {
+    "rev_g3": ("revenueGrowth3Y", "revenueGrowth5Y"),
+    "rev_ttm": ("revenueGrowthTTMYoy", "revenueGrowthQuarterlyYoy"),
+    "eps_g3": ("epsGrowth3Y", "epsGrowth5Y"),
+    "eps_ttm": ("epsGrowthTTMYoy", "epsGrowthQuarterlyYoy"),
+    "om": ("operatingMarginTTM", "operatingMarginAnnual"),
+    "roe": ("roeTTM", "roeRfy"),
+    "roa": ("roaTTM", "roaRfy"),
+    "de": ("totalDebt/totalEquityQuarterly", "totalDebt/totalEquityAnnual", "debtToEquityAnnual"),
+    "cr": ("currentRatioQuarterly", "currentRatioAnnual"),
+    "pe": ("peTTM", "peBasicExclExtraTTM", "peNormalizedAnnual"),
+    "hi52": ("52WeekHigh",),
+    "ret52": ("52WeekPriceReturnDaily",),
+}
+
+def quality_score(q, price):
+    """Growth & Quality score 0-100 + red flags, from fundamentals only (no price prediction).
+    Weights: growth 35 · profitability 25 · balance sheet 15 · valuation vs growth (PEG) 15 · price strength 10.
+    Metrics that are missing are skipped and the weights re-normalised; < 50% coverage -> None."""
+    def sc(v, lo, hi):                       # linear 0..1 (lo > hi = lower is better)
+        if v is None or not np.isfinite(v):
+            return None
+        return float(min(max((v - lo) / (hi - lo), 0.0), 1.0))
+
+    def avg(parts):
+        parts = [(s, w) for s, w in parts if s is not None]
+        tw = sum(w for _, w in parts)
+        return sum(s * w for s, w in parts) / tw if tw else None
+
+    rev = q.get("rev_g3") if q.get("rev_g3") is not None else q.get("rev_ttm")
+    epg = q.get("eps_g3") if q.get("eps_g3") is not None else q.get("eps_ttm")
+    acc = None if (q.get("rev_ttm") is None or q.get("rev_g3") is None) else q["rev_ttm"] - q["rev_g3"]
+    G = avg([(sc(rev, 0, 20), .5), (sc(epg, 0, 25), .35), (sc(acc, -5, 5), .15)])
+    P = avg([(sc(q.get("om"), 0, 25), .4), (sc(q.get("roe"), 5, 20), .3), (sc(q.get("roa"), 2, 12), .3)])
+    B = avg([(sc(q.get("de"), 2.0, 0.3), .5), (sc(q.get("cr"), 1.0, 2.0), .5)])
+    pe = q.get("pe")
+    peg = pe / epg if (pe is not None and pe > 0 and epg is not None and epg > 0) else None
+    V = sc(peg, 3.0, 1.0) if peg is not None else (sc(pe, 50, 15) if (pe is not None and pe > 0) else None)
+    hi = q.get("hi52")
+    ratio = price / hi if (hi and hi > 0) else None
+    M = avg([(sc(ratio, 0.5, 0.95), .6), (sc(q.get("ret52"), 0, 50), .4)])
+
+    facts = {"G": (G, 35), "P": (P, 25), "B": (B, 15), "V": (V, 15), "M": (M, 10)}
+    have = [(v, w) for v, w in facts.values() if v is not None]
+    if sum(w for _, w in have) < 50:
+        return None
+    score = int(round(100 * sum(v * w for v, w in have) / sum(w for _, w in have)))
+
+    flags, eps = [], q.get("eps")
+    if eps is not None and eps <= 0:
+        flags.append("loss-making")
+    if q.get("rev_ttm") is not None and q["rev_ttm"] < 0:
+        flags.append("revenue shrinking")
+    if q.get("de") is not None and q["de"] > 2:
+        flags.append("high debt")
+    if q.get("cr") is not None and q["cr"] < 1:
+        flags.append("weak liquidity")
+    if peg is not None and peg > 3:
+        flags.append("expensive vs growth")
+    if ratio is not None and ratio < 0.6:
+        flags.append("far below 52w high")
+
+    if "loss-making" in flags:
+        tier = "⚠️ Unprofitable"
+    elif score >= 70 and (G or 0) >= 0.5:
+        tier = "🚀 Compounder"
+    elif score >= 60:
+        tier = "🌱 Quality growth"
+    elif score >= 50:
+        tier = "➖ Average"
+    else:
+        tier = "⚠️ Weak"
+    fm = lambda x: "–" if x is None else f"{x * 100:.0f}"
+    return {"score": score, "tier": tier, "flags": flags, "rev": rev, "de": q.get("de"),
+            "text": f"{tier} {score} (G{fm(G)} P{fm(P)} B{fm(B)} V{fm(V)} M{fm(M)})"}
 
 # ── Volume flow: how unusual is volume, and which side is it on? ─────────────
 def _robust_z(x, window=50):
@@ -1427,7 +1506,7 @@ def journal_plan(cdf, long, live, atr_mult, rr):
             "bar_t": int(pd.Timestamp(d["t"].iloc[-1]).timestamp() * 1000)}
 
 def extras_json(ex, regime):
-    keys = ("Breakout", "Crash", "Flow", "OI", "Book", "Funding", "L/S", "Crowding", "Earnings", "Analyst", "Turn", "Graham")
+    keys = ("Breakout", "Crash", "Flow", "OI", "Book", "Funding", "L/S", "Crowding", "Earnings", "Analyst", "Turn", "Graham", "GQ")
     d = {k: ex.get(k) for k in keys if ex.get(k) is not None}
     for k in ("RS 1w %", "RS 4w %"):
         if ex.get(k) is not None:
@@ -1704,7 +1783,7 @@ def render_journal():
 # ── Enrichment for MATCH/WATCH rows ─────────────────────────────
 @st.cache_data(ttl=300, show_spinner=False)
 def enrich_rows(market, src, syms, tf, n_break, vol_mult, live, oi_lb, fh_key, long_bias, j_atr, j_rr, lf_, ls_=200,
-                g_on=False, g_cap=15.0, g_strict=False, aaa_y=5.0):
+                g_on=False, g_cap=15.0, g_strict=False, aaa_y=5.0, q_on=False):
     stocks = market == "stocks"
     store = _store()
     bench = get_closes(store, src, "SPY" if stocks else "BTCUSDT", "1d")
@@ -1795,6 +1874,21 @@ def enrich_rows(market, src, syms, tf, n_break, vol_mult, live, oi_lb, fh_key, l
             v, gg = gv
             res[s]["Graham"], res[s]["_mos"] = graham_label(v, px, gg, gi["g"] is None)
             res[s]["Graham V"], res[s]["MoS %"], res[s]["_gv"] = round(v, 2), round(res[s]["_mos"], 1), v
+    if stocks and fh_key and q_on:
+        n_q = 0
+        for s in syms:
+            if n_q >= GRAHAM_MAX:
+                res[s]["GQ"] = "limit"
+                continue
+            n_q += 1
+            gi, px = graham_inputs(s, fh_key), res[s].get("_px")
+            qs = quality_score(gi, px) if (gi and px) else None
+            if qs is None:
+                res[s]["GQ"] = "n/a"
+                continue
+            res[s]["GQ"], res[s]["GQ score"], res[s]["_gq"] = qs["text"], qs["score"], qs["score"]
+            res[s]["Flags"], res[s]["_gqflags"], res[s]["_de"] = ", ".join(qs["flags"]) or "-", qs["flags"], qs["de"]
+            res[s]["Rev g %"] = None if qs["rev"] is None else round(qs["rev"], 1)
     return res
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -1863,6 +1957,8 @@ def conviction2(ex, long, status, regime, macro_h=None):
         p["Trend"] = 5 if ex["_adx"] >= 25 else (-6 if ex["_adx"] < 15 else 0)
     if ok(ex.get("_mos")):                        # Graham margin of safety (weak weight: poor fit for growth stocks)
         p["Value"] = 5 * max(-1.0, min(1.0, sg * ex["_mos"] / 40))
+    if ok(ex.get("_gq")):                         # growth & quality: good businesses help longs, weak ones help shorts
+        p["Quality"] = sg * 8 * max(-1.0, min(1.0, (ex["_gq"] - 50) / 30))
     score = int(round(max(0, min(100, 50 + sum(p.values())))))
     core = ("Flow", "Crash", "Regime", "RelStr", "Extend", "Trend")
     cov = sum(k in p for k in core) / len(core)
@@ -1874,6 +1970,7 @@ DRIVER_HELP.update({
     "Extend": "Distance from fast EMA in ATR: pullbacks score, chasing (>3 ATR) is penalised",
     "Trend": "ADX: trending (>=25) helps, chop (<15) hurts",
     "Value": "Graham fair value: cheap vs V helps longs, expensive helps shorts (weak weight)",
+    "Quality": "Growth & quality score: growth, margins, ROE, debt, PEG, price strength",
 })
 
 
@@ -2316,6 +2413,7 @@ hide_crowd = st.sidebar.toggle("Hide setups crowded in my direction", False,
                                help="Longs: funding / long-share very high. Shorts: very negative (crypto only).")
 req_oi = False
 graham_on, g_strict, g_cap, aaa_y = False, False, 15.0, 5.0
+q_on, q_min, q_profit, q_grow, q_maxde = False, 0, False, False, 0.0
 min_analyst = "Any"
 hide_earn = 0
 fh_key = ""
@@ -2335,6 +2433,14 @@ if is_stocks:
     aaa_y = st.sidebar.number_input("AAA corporate yield Y (%)", 1.0, 15.0, float(_aaa or 5.0), 0.05,
                                     help="Auto-filled from FRED (DAAA) when reachable; edit to override.")
     st.sidebar.caption("FRED DAAA: " + (f"{_aaa:.2f}%" if _aaa else "unavailable, using manual value"))
+
+    st.sidebar.subheader("🌱 Growth & quality screen")
+    q_on = st.sidebar.toggle("Growth & quality score (needs Finnhub key)", True,
+                             help="Fundamentals: growth, margins, ROE, debt, PEG, price strength. Same API call as Graham (cached).")
+    q_min = st.sidebar.slider("Hide MATCH/WATCH with GQ score below (0 = off)", 0, 90, 0, 5)
+    q_profit = st.sidebar.toggle("Only profitable companies (EPS > 0)", False)
+    q_grow = st.sidebar.toggle("Only companies with growing revenue (TTM YoY > 0)", False)
+    q_maxde = st.sidebar.number_input("Max debt / equity (0 = off)", 0.0, 10.0, 0.0, 0.25)
 else:
     req_oi = st.sidebar.toggle("Only OI rising with price up", False)
 
@@ -2482,7 +2588,7 @@ if extras_on:
             try:
                 extra = enrich_rows(market, data_src, tuple(pool_syms), sig_tf, n_break, vol_mult,
                                     live, oi_lb, fh_key, long_bias, float(j_atr), j_rr, lf, ls,
-                                    graham_on and is_stocks, float(g_cap), g_strict, float(aaa_y))
+                                    graham_on and is_stocks, float(g_cap), g_strict, float(aaa_y), q_on and is_stocks)
             except Exception as e:
                 st.warning(f"Extra signals failed: {e}")
     try:
@@ -2490,10 +2596,10 @@ if extras_on:
     except Exception:
         regime = None
     for col in ("Breakout", "Crash", "Flow", "OI", "Book", "Funding", "L/S", "Crowding",
-                "RS 1w %", "RS 4w %", "Earnings", "Analyst", "Turn", "Graham", "Graham V", "MoS %"):
+                "RS 1w %", "RS 4w %", "Earnings", "Analyst", "Turn", "Graham", "Graham V", "MoS %", "GQ", "GQ score", "Rev g %", "Flags"):
         if any(col in v for v in extra.values()):
             df[col] = df["Symbol"].map(lambda s, c=col: extra.get(s, {}).get(c))
-    for col in ("Crash", "RS 1w %", "RS 4w %", "Graham V", "MoS %"):
+    for col in ("Crash", "RS 1w %", "RS 4w %", "Graham V", "MoS %", "GQ score", "Rev g %"):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     if extra:
@@ -2542,6 +2648,9 @@ if extras_on:
     as_map = {s: v.get("_as") for s, v in extra.items()}
     ed_map = {s: v.get("_ed") for s, v in extra.items()}
     crowd_map = {s: v.get("_crowd") for s, v in extra.items()}
+    gqs_map = {s: v.get("_gq") for s, v in extra.items()}
+    gqf_map = {s: v.get("_gqflags") for s, v in extra.items()}
+    de_map = {s: v.get("_de") for s, v in extra.items()}
 
     def _crowded(s):
         c = crowd_map.get(s)
@@ -2561,6 +2670,14 @@ if extras_on:
             f = f[~f["Symbol"].map(lambda s: ed_map.get(s) is not None and ed_map[s] <= hide_earn).astype(bool)]
         if hide_crowd:
             f = f[~f["Symbol"].map(_crowded).astype(bool)]
+        if q_min and gqs_map:
+            f = f[~f["Symbol"].map(lambda s: gqs_map.get(s) is not None and gqs_map[s] < q_min).astype(bool)]
+        if q_profit:
+            f = f[~f["Symbol"].map(lambda s: "loss-making" in (gqf_map.get(s) or [])).astype(bool)]
+        if q_grow:
+            f = f[~f["Symbol"].map(lambda s: "revenue shrinking" in (gqf_map.get(s) or [])).astype(bool)]
+        if q_maxde:
+            f = f[~f["Symbol"].map(lambda s: de_map.get(s) is not None and de_map[s] > q_maxde).astype(bool)]
         if AI_ON and ai_min_p and ai_pred and "AI P(win)" in f.columns:
             f = f[~(pd.to_numeric(f["AI P(win)"], errors="coerce") < ai_min_p)]      # NaN (no forecast) is kept
         return f
@@ -2669,11 +2786,13 @@ if "Crash" in df.columns:
         cfg["Crash"] = st.column_config.ProgressColumn("Crash risk", min_value=0, max_value=100, format="%d")
 if "Conviction" in df.columns:
         cfg["Conviction"] = st.column_config.ProgressColumn("Conviction", min_value=0, max_value=100, format="%d")
+if "GQ score" in df.columns:
+    cfg["GQ score"] = st.column_config.ProgressColumn("GQ score", min_value=0, max_value=100, format="%d")
 if "AI P(win)" in df.columns:
     cfg["AI P(win)"] = st.column_config.ProgressColumn("AI P(win)", min_value=0, max_value=100, format="%.0f%%")
     cfg["AI EV (R)"] = st.column_config.NumberColumn("AI EV (R)", format="%+.2f")
 for _c in ("Breakout", "Flow", "OI", "Book", "Funding", "L/S", "Crowding", "Earnings", "Analyst",
-               "RS 1w %", "RS 4w %", "Turn", "Graham"):
+               "RS 1w %", "RS 4w %", "Turn", "Graham", "GQ", "Flags"):
         if _c in df.columns and _c not in cfg:
             cfg[_c] = st.column_config.TextColumn(_c)
 
@@ -2689,6 +2808,31 @@ if de is not None and "Decision" in match.columns and not match.empty:
         st.caption(f"Total risk {_tot}% (scale {_sc}). Skipped as near-duplicates: "
                    + (", ".join(f"{s_}≈{v_[0]} ({v_[1]:.2f})" for s_, v_ in _skip.items()) or "none"))
 
+# ── Long-term growth & value shortlist (stocks, long side) ──
+if long_bias and "GQ score" in df.columns:
+    with st.expander("🌟 Long-term growth & value shortlist (quality + valuation + timing)", expanded=True):
+        _sl_min = st.slider("Min GQ score", 40, 90, 60, 5, key="sl_min")
+        _pl = pd.concat([match, watch])
+        _gq = pd.to_numeric(_pl["GQ score"], errors="coerce")
+        _pl = _pl[(_gq >= _sl_min) & ~_pl["Flags"].astype(str).str.contains("loss-making")].copy()
+        if _pl.empty:
+            st.info("No MATCH/WATCH stock passes the quality bar right now (needs the Finnhub key).")
+        else:
+            _g = pd.to_numeric(_pl["GQ score"], errors="coerce")
+            _mos = pd.to_numeric(_pl["MoS %"], errors="coerce") if "MoS %" in _pl.columns else pd.Series(np.nan, index=_pl.index)
+            _val = ((_mos + 25) / 65).clip(0, 1).mul(100).fillna(50.0)           # unknown valuation = neutral
+            _tim = pd.to_numeric(_pl["Conviction"], errors="coerce").fillna(50.0) if "Conviction" in _pl.columns else 50.0
+            _pl["Long-term"] = (0.5 * _g + 0.2 * _val + 0.3 * _tim).round(0)
+            _cols = [c for c in ("Symbol", "Price", "Status", "Long-term", "GQ score", "GQ", "MoS %", "Conviction",
+                                 "Rev g %", "Analyst", "Earnings", "Flags") if c in _pl.columns]
+            st.dataframe(_pl.sort_values("Long-term", ascending=False)[_cols].head(15), hide_index=True,
+                         width="content", column_config={
+                             "Long-term": st.column_config.ProgressColumn("Long-term", min_value=0, max_value=100, format="%d"),
+                             "GQ score": st.column_config.ProgressColumn("GQ score", min_value=0, max_value=100, format="%d")})
+            st.caption("Long-term = 50% quality/growth (GQ) + 20% valuation (Graham margin of safety) + 30% timing "
+                       "(conviction). Fundamentals lag and no score can predict the future: use this as a filter for "
+                       "candidates, check the company yourself, and size positions for being wrong. "
+                       "The journal tests the 'Quality' component once you have 100+ closed signals.")
 # ── [readiness-patch] Readiness radar: what is about to flip, in which direction ──
 with st.expander("🎯 Readiness radar: setups about to flip (before they become MATCH)", expanded=True):
     _q1, _q2, _q3 = st.columns(3)
@@ -2807,7 +2951,7 @@ with t4:
                 ex_live = {"Breakout": bo, "Crash": cs[0] if cs else None, "OI": exs.get("OI"),
                            "_dz": fl[2] if fl else None, "_imb": lv["imbalance_w"] if lv else None,
                            "_as": exs.get("_as"), "_crowd": exs.get("_crowd"), "_rs": exs.get("_rs"),
-                           "_ed": exs.get("_ed"), "_ext": ext_atr(cdf, lf, live), "_adx": adx(cdf), "_mos": exs.get("_mos")}
+                           "_ed": exs.get("_ed"), "_ext": ext_atr(cdf, lf, live), "_adx": adx(cdf), "_mos": exs.get("_mos"), "_gq": exs.get("_gq")}
                 cv, parts = conviction2(ex_live, long, "MATCH" if sym in now else "WATCH", regime, macro_h)
                 blocked = blocked_tps(lv, entry, tps, long)
                 _rxs = df.loc[df["Symbol"] == sym, "Risk x"] if "Risk x" in df.columns else []
@@ -2930,6 +3074,10 @@ with t4:
                     if exs.get("Graham") and exs["Graham"] not in ("n/a", "limit"):
                         st.metric("Graham fair value", fmt(exs["_gv"]) if exs.get("_gv") else exs["Graham"],
                                   exs["Graham"] if exs.get("_gv") else None, delta_color="off")
+                    if exs.get("GQ") and exs["GQ"] not in ("n/a", "limit"):
+                        st.metric("Growth & quality", exs["GQ"])
+                        if exs.get("Flags") and exs["Flags"] != "-":
+                            st.caption("🚩 " + exs["Flags"])
 
                 # "What is driving this score": every component with its points
                 with st.expander("🧭 Why this grade? (drivers, risks, catalysts)", expanded=True):

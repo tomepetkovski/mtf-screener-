@@ -719,6 +719,66 @@ def analyst_rating(sym, key):
         store[k] = (time.time(), res)
     return res
 
+# ── Graham fair value (stocks) ───────────────────────────────────────────────
+GRAHAM_MAX = 100          # Finnhub free tier: 1 extra call per symbol, cached 24h
+
+def aaa_yield():
+    """Moody's AAA corporate yield (%) from FRED (no key), cached 12h. None on failure."""
+    k = ("__aaa__",)
+    with _CACHE_LOCK:
+        hit = _SHARED.get(k)
+    if hit and time.time() - hit[0] < 43200:
+        return hit[1]
+    try:
+        r = requests.get("https://fred.stlouisfed.org/graph/fredgraph.csv", params={"id": "DAAA"},
+                         timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        vals = [ln.split(",")[1] for ln in r.text.splitlines()[1:] if "," in ln]
+        vals = [float(v) for v in vals if v not in ("", ".")]
+        y = vals[-1]
+        if 0.5 < y < 20:
+            with _CACHE_LOCK:
+                _SHARED[k] = (time.time(), y)
+            return y
+    except Exception:
+        pass
+    return None
+
+def graham_inputs(sym, key):
+    """{'eps': TTM EPS, 'g': EPS growth % (5Y -> 3Y -> TTM YoY)} from Finnhub; cached 24h."""
+    store = _store()
+    k = ("__gm__", sym)
+    with _CACHE_LOCK:
+        hit = store.get(k)
+    if hit and time.time() - hit[0] < 86400:
+        return hit[1]
+    with _FH_LOCK:
+        time.sleep(1.05)
+        d = fetch(FH, "/api/v1/stock/metric", {"symbol": sym.replace("-", "."), "metric": "all", "token": key})
+    m = d.get("metric") if isinstance(d, dict) else None
+    if m is None:
+        return None                                          # error / rate limit: do not cache
+    first = lambda *ks: next((m[x] for x in ks if m.get(x) is not None), None)
+    res = {"eps": first("epsTTM", "epsInclExtraItemsTTM"),
+           "g": first("epsGrowth5Y", "epsGrowth3Y", "epsGrowthTTMYoy")}
+    with _CACHE_LOCK:
+        store[k] = (time.time(), res)
+    return res
+
+def graham_value(eps, g, y, g_cap=15.0, strict=False):
+    """V = EPS x (8.5 + 2g) x 4.4 / Y   (strict: 7 + g). Returns (V, g_used) or None."""
+    if eps is None or not np.isfinite(eps) or eps <= 0 or not y or y <= 0:
+        return None
+    gg = 0.0 if g is None else float(min(max(g, 0.0), g_cap))
+    mult = (7 + gg) if strict else (8.5 + 2 * gg)
+    return float(eps * mult * 4.4 / y), gg
+
+def graham_label(v, price, gg, g_missing=False):
+    """(text, margin of safety %). MoS = (1 - price / V) x 100; '*' = growth missing, 0% assumed."""
+    mos = (1 - price / v) * 100
+    icon = ("🟢🟢" if mos >= 30 else "🟢" if mos >= 20 else "🟡" if mos > 0
+            else "➖" if mos > -25 else "🔴")
+    return f"{icon} MoS {mos:+.0f}% (g {gg:.0f}%{'*' if g_missing else ''})", mos
+
 # ── Volume flow: how unusual is volume, and which side is it on? ─────────────
 def _robust_z(x, window=50):
     """z-score of the last value vs the previous `window` values using median/MAD.
@@ -1367,7 +1427,7 @@ def journal_plan(cdf, long, live, atr_mult, rr):
             "bar_t": int(pd.Timestamp(d["t"].iloc[-1]).timestamp() * 1000)}
 
 def extras_json(ex, regime):
-    keys = ("Breakout", "Crash", "Flow", "OI", "Book", "Funding", "L/S", "Crowding", "Earnings", "Analyst", "Turn")
+    keys = ("Breakout", "Crash", "Flow", "OI", "Book", "Funding", "L/S", "Crowding", "Earnings", "Analyst", "Turn", "Graham")
     d = {k: ex.get(k) for k in keys if ex.get(k) is not None}
     for k in ("RS 1w %", "RS 4w %"):
         if ex.get(k) is not None:
@@ -1643,7 +1703,8 @@ def render_journal():
 
 # ── Enrichment for MATCH/WATCH rows ─────────────────────────────
 @st.cache_data(ttl=300, show_spinner=False)
-def enrich_rows(market, src, syms, tf, n_break, vol_mult, live, oi_lb, fh_key, long_bias, j_atr, j_rr, lf_, ls_=200):
+def enrich_rows(market, src, syms, tf, n_break, vol_mult, live, oi_lb, fh_key, long_bias, j_atr, j_rr, lf_, ls_=200,
+                g_on=False, g_cap=15.0, g_strict=False, aaa_y=5.0):
     stocks = market == "stocks"
     store = _store()
     bench = get_closes(store, src, "SPY" if stocks else "BTCUSDT", "1d")
@@ -1657,6 +1718,7 @@ def enrich_rows(market, src, syms, tf, n_break, vol_mult, live, oi_lb, fh_key, l
             if cdf is None or len(cdf) < 30:
                 return s, out
             out["Breakout"] = breakout_signal(cdf, n_break, vol_mult, live) or "n/a"
+            out["_px"] = float(cdf["close"].iloc[-1])
             cs = crash_score(cdf, live)
             out["Crash"] = cs[0] if cs else None
             out["_ext"] = ext_atr(cdf, lf_, live)
@@ -1715,6 +1777,24 @@ def enrich_rows(market, src, syms, tf, n_break, vol_mult, live, oi_lb, fh_key, l
                 continue
             label, score = analyst_rating(s, fh_key)
             res[s]["Analyst"], res[s]["_as"] = label, score
+    if stocks and fh_key and g_on:
+        n_g = 0
+        for s in syms:
+            if n_g >= GRAHAM_MAX:
+                res[s]["Graham"] = "limit"
+                continue
+            n_g += 1
+            gi, px = graham_inputs(s, fh_key), res[s].get("_px")
+            if not gi or not px:
+                res[s]["Graham"] = "n/a"
+                continue
+            gv = graham_value(gi["eps"], gi["g"], aaa_y, g_cap, g_strict)
+            if gv is None:
+                res[s]["Graham"] = "n/a (EPS<=0)"
+                continue
+            v, gg = gv
+            res[s]["Graham"], res[s]["_mos"] = graham_label(v, px, gg, gi["g"] is None)
+            res[s]["Graham V"], res[s]["MoS %"], res[s]["_gv"] = round(v, 2), round(res[s]["_mos"], 1), v
     return res
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -1781,6 +1861,8 @@ def conviction2(ex, long, status, regime, macro_h=None):
         p["Extend"] = 5 if 0 <= e <= 1.5 else (-min(12.0, 3 * (e - 2)) if e > 3 else 0.0)
     if ok(ex.get("_adx")):
         p["Trend"] = 5 if ex["_adx"] >= 25 else (-6 if ex["_adx"] < 15 else 0)
+    if ok(ex.get("_mos")):                        # Graham margin of safety (weak weight: poor fit for growth stocks)
+        p["Value"] = 5 * max(-1.0, min(1.0, sg * ex["_mos"] / 40))
     score = int(round(max(0, min(100, 50 + sum(p.values())))))
     core = ("Flow", "Crash", "Regime", "RelStr", "Extend", "Trend")
     cov = sum(k in p for k in core) / len(core)
@@ -1791,6 +1873,7 @@ def conviction2(ex, long, status, regime, macro_h=None):
 DRIVER_HELP.update({
     "Extend": "Distance from fast EMA in ATR: pullbacks score, chasing (>3 ATR) is penalised",
     "Trend": "ADX: trending (>=25) helps, chop (<15) hurts",
+    "Value": "Graham fair value: cheap vs V helps longs, expensive helps shorts (weak weight)",
 })
 
 
@@ -2232,6 +2315,7 @@ req_break = st.sidebar.toggle("Only breakouts", False)
 hide_crowd = st.sidebar.toggle("Hide setups crowded in my direction", False,
                                help="Longs: funding / long-share very high. Shorts: very negative (crypto only).")
 req_oi = False
+graham_on, g_strict, g_cap, aaa_y = False, False, 15.0, 5.0
 min_analyst = "Any"
 hide_earn = 0
 fh_key = ""
@@ -2242,6 +2326,15 @@ if is_stocks:
         fh_key = st.secrets["FINNHUB_KEY"]
     except Exception:
         fh_key = st.sidebar.text_input("Finnhub API key (free): analyst ratings + earnings dates", type="password")
+    st.sidebar.subheader("💎 Graham fair value")
+    graham_on = st.sidebar.toggle("Graham fair value (needs Finnhub key)", True,
+                                  help="V = EPS x (8.5 + 2g) x 4.4 / Y. Designed for stable, profitable companies.")
+    g_strict = st.sidebar.toggle("Stricter formula (7 + g)", False)
+    g_cap = st.sidebar.slider("Max growth g (%)", 5, 25, 15)
+    _aaa = aaa_yield()
+    aaa_y = st.sidebar.number_input("AAA corporate yield Y (%)", 1.0, 15.0, float(_aaa or 5.0), 0.05,
+                                    help="Auto-filled from FRED (DAAA) when reachable; edit to override.")
+    st.sidebar.caption("FRED DAAA: " + (f"{_aaa:.2f}%" if _aaa else "unavailable, using manual value"))
 else:
     req_oi = st.sidebar.toggle("Only OI rising with price up", False)
 
@@ -2388,7 +2481,8 @@ if extras_on:
         with st.spinner("Computing extra signals..."):
             try:
                 extra = enrich_rows(market, data_src, tuple(pool_syms), sig_tf, n_break, vol_mult,
-                                    live, oi_lb, fh_key, long_bias, float(j_atr), j_rr, lf, ls)
+                                    live, oi_lb, fh_key, long_bias, float(j_atr), j_rr, lf, ls,
+                                    graham_on and is_stocks, float(g_cap), g_strict, float(aaa_y))
             except Exception as e:
                 st.warning(f"Extra signals failed: {e}")
     try:
@@ -2396,10 +2490,10 @@ if extras_on:
     except Exception:
         regime = None
     for col in ("Breakout", "Crash", "Flow", "OI", "Book", "Funding", "L/S", "Crowding",
-                "RS 1w %", "RS 4w %", "Earnings", "Analyst", "Turn"):
+                "RS 1w %", "RS 4w %", "Earnings", "Analyst", "Turn", "Graham", "Graham V", "MoS %"):
         if any(col in v for v in extra.values()):
             df[col] = df["Symbol"].map(lambda s, c=col: extra.get(s, {}).get(c))
-    for col in ("Crash", "RS 1w %", "RS 4w %"):
+    for col in ("Crash", "RS 1w %", "RS 4w %", "Graham V", "MoS %"):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     if extra:
@@ -2579,7 +2673,7 @@ if "AI P(win)" in df.columns:
     cfg["AI P(win)"] = st.column_config.ProgressColumn("AI P(win)", min_value=0, max_value=100, format="%.0f%%")
     cfg["AI EV (R)"] = st.column_config.NumberColumn("AI EV (R)", format="%+.2f")
 for _c in ("Breakout", "Flow", "OI", "Book", "Funding", "L/S", "Crowding", "Earnings", "Analyst",
-               "RS 1w %", "RS 4w %", "Turn"):
+               "RS 1w %", "RS 4w %", "Turn", "Graham"):
         if _c in df.columns and _c not in cfg:
             cfg[_c] = st.column_config.TextColumn(_c)
 
@@ -2713,7 +2807,7 @@ with t4:
                 ex_live = {"Breakout": bo, "Crash": cs[0] if cs else None, "OI": exs.get("OI"),
                            "_dz": fl[2] if fl else None, "_imb": lv["imbalance_w"] if lv else None,
                            "_as": exs.get("_as"), "_crowd": exs.get("_crowd"), "_rs": exs.get("_rs"),
-                           "_ed": exs.get("_ed"), "_ext": ext_atr(cdf, lf, live), "_adx": adx(cdf)}
+                           "_ed": exs.get("_ed"), "_ext": ext_atr(cdf, lf, live), "_adx": adx(cdf), "_mos": exs.get("_mos")}
                 cv, parts = conviction2(ex_live, long, "MATCH" if sym in now else "WATCH", regime, macro_h)
                 blocked = blocked_tps(lv, entry, tps, long)
                 _rxs = df.loc[df["Symbol"] == sym, "Risk x"] if "Risk x" in df.columns else []
@@ -2833,6 +2927,9 @@ with t4:
                         st.metric("Earnings", exs["Earnings"])
                     if exs.get("Analyst"):
                         st.metric("Analyst rating", exs["Analyst"])
+                    if exs.get("Graham") and exs["Graham"] not in ("n/a", "limit"):
+                        st.metric("Graham fair value", fmt(exs["_gv"]) if exs.get("_gv") else exs["Graham"],
+                                  exs["Graham"] if exs.get("_gv") else None, delta_color="off")
 
                 # "What is driving this score": every component with its points
                 with st.expander("🧭 Why this grade? (drivers, risks, catalysts)", expanded=True):
